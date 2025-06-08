@@ -79,6 +79,7 @@ def linear_to_lora_layers(
         keys = set(keys)
     elif model.model_type in [
         "mistral",
+        "mistral3",
         "llama",
         "phi",
         "mixtral",
@@ -87,6 +88,8 @@ def linear_to_lora_layers(
         "hunyuan",
         "qwen2",
         "qwen2_moe",
+        "qwen3",
+        "qwen3_moe",
         "phimoe",
         "gemma",
         "gemma2",
@@ -103,6 +106,8 @@ def linear_to_lora_layers(
         "olmo2",
         "olmoe",
         "internlm3",
+        "glm4",
+        "mimo",
     ]:
         keys = set(["self_attn.q_proj", "self_attn.v_proj"])
         if model.model_type in ["mixtral", "phimoe"]:
@@ -110,7 +115,7 @@ def linear_to_lora_layers(
         if model.model_type == "qwen2_moe":
             keys.add("mlp.gate")
             keys.add("mlp.shared_expert_gate")
-        if model.model_type == "olmoe":
+        if model.model_type in ["olmoe", "qwen3_moe"]:
             keys.add("mlp.gate")
 
     elif model.model_type == "gpt_bigcode":
@@ -258,20 +263,24 @@ def remove_lora_layers(model: nn.Module) -> nn.Module:
     return model
 
 
-def nparams(module):
-    if hasattr(module, "bits"):
-        n = 0 if not hasattr(module, "bias") else module.bias.size
-        return n + module.weight.size * 32 // module.bits
-    return sum(v.size for _, v in tree_flatten(module.parameters()))
-
-
-def print_trainable_parameters(model):
+def get_total_parameters(model):
     leaf_modules = tree_flatten(
         model.leaf_modules(), is_leaf=lambda m: isinstance(m, nn.Module)
     )
-    total_p = sum(nparams(m) for _, m in leaf_modules) / 10**6
+
+    def nparams(m):
+        if hasattr(m, "bits"):
+            n = 0 if not hasattr(m, "bias") else m.bias.size
+            return n + m.weight.size * 32 // m.bits
+        return sum(v.size for _, v in tree_flatten(m.parameters()))
+
+    return sum(nparams(m) for _, m in leaf_modules)
+
+
+def print_trainable_parameters(model):
+    total_p = get_total_parameters(model) / 1e6
     trainable_p = (
-        sum(v.size for _, v in tree_flatten(model.trainable_parameters())) / 10**6
+        sum(v.size for _, v in tree_flatten(model.trainable_parameters())) / 1e6
     )
     print(
         f"Trainable parameters: {(trainable_p * 100 / total_p):.3f}% "

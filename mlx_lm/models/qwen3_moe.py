@@ -1,7 +1,7 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2025 Apple Inc.
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -17,33 +17,24 @@ class ModelArgs(BaseModelArgs):
     num_hidden_layers: int
     intermediate_size: int
     num_attention_heads: int
-    num_experts_per_tok: int
     num_experts: int
+    num_experts_per_tok: int
+    decoder_sparse_step: int
+    mlp_only_layers: List[int]
     moe_intermediate_size: int
-    shared_expert_intermediate_size: int
     rms_norm_eps: float
     vocab_size: int
-    num_key_value_heads: Optional[int] = None
-    rope_theta: float = 1000000
-    rope_traditional: bool = False
+    num_key_value_heads: int
+    head_dim: int
+    rope_theta: float
+    tie_word_embeddings: bool
+    max_position_embeddings: int
+    norm_topk_prob: bool
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
-    tie_word_embeddings: bool = False
-
-    def __post_init__(self):
-        if self.num_key_value_heads is None:
-            self.num_key_value_heads = self.num_attention_heads
-
-        if self.rope_scaling:
-            required_keys = {"factor", "type"}
-            if not all(key in self.rope_scaling for key in required_keys):
-                raise ValueError(f"rope_scaling must contain keys {required_keys}")
-
-            if self.rope_scaling["type"] != "linear":
-                raise ValueError("rope_scaling 'type' currently only supports 'linear'")
 
 
 class Attention(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
 
         dim = args.hidden_size
@@ -51,17 +42,22 @@ class Attention(nn.Module):
         assert args.num_key_value_heads is not None
         self.n_kv_heads = n_kv_heads = args.num_key_value_heads
 
-        head_dim = args.hidden_size // n_heads
+        head_dim = getattr(
+            args, "head_dim", args.hidden_size // args.num_attention_heads
+        )
         self.scale = head_dim**-0.5
 
-        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=True)
-        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=True)
-        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=True)
+        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
+        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
+        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
+
+        self.q_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
+        self.k_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
 
         self.rope = nn.RoPE(
             head_dim,
-            traditional=args.rope_traditional,
+            traditional=False,
             base=args.rope_theta,
         )
 
@@ -76,8 +72,12 @@ class Attention(nn.Module):
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
         # Prepare the queries, keys and values for the attention computation
-        queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
-        keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        queries = self.q_norm(queries.reshape(B, L, self.n_heads, -1)).transpose(
+            0, 2, 1, 3
+        )
+        keys = self.k_norm(keys.reshape(B, L, self.n_kv_heads, -1)).transpose(
+            0, 2, 1, 3
+        )
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
         if cache is not None:
@@ -106,21 +106,18 @@ class MLP(nn.Module):
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-class Qwen2MoeSparseMoeBlock(nn.Module):
+class Qwen3MoeSparseMoeBlock(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         dim = args.hidden_size
         intermediate_size = args.moe_intermediate_size
-        shared_expert_intermediate_size = args.shared_expert_intermediate_size
 
         self.num_experts = num_experts = args.num_experts
         self.top_k = args.num_experts_per_tok
+        self.norm_topk_prob = args.norm_topk_prob
 
         self.gate = nn.Linear(dim, num_experts, bias=False)
         self.switch_mlp = SwitchGLU(dim, intermediate_size, num_experts)
-
-        self.shared_expert = MLP(dim, shared_expert_intermediate_size)
-        self.shared_expert_gate = nn.Linear(dim, 1, bias=False)
 
     def __call__(
         self,
@@ -132,30 +129,33 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         k = self.top_k
         inds = mx.stop_gradient(mx.argpartition(-gates, kth=k - 1, axis=-1)[..., :k])
         scores = mx.take_along_axis(gates, inds, axis=-1)
+        if self.norm_topk_prob:
+            scores /= mx.sum(scores, axis=-1, keepdims=True)
 
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
 
-        shared_expert_output = self.shared_expert(x)
-        shared_expert_output = (
-            mx.sigmoid(self.shared_expert_gate(x)) * shared_expert_output
-        )
-
-        return y + shared_expert_output
+        return y
 
 
-class Qwen2MoeDecoderLayer(nn.Module):
-    def __init__(self, args: ModelArgs):
+class Qwen3MoeDecoderLayer(nn.Module):
+    def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
         self.hidden_size = args.hidden_size
-        self.self_attn = Attention(args)
-        self.mlp = Qwen2MoeSparseMoeBlock(args)
+        self.self_attn = Attention(args, layer_idx)
 
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
             args.hidden_size, eps=args.rms_norm_eps
         )
         self.args = args
+
+        if (layer_idx not in args.mlp_only_layers) and (
+            args.num_experts > 0 and (layer_idx + 1) % args.decoder_sparse_step == 0
+        ):
+            self.mlp = Qwen3MoeSparseMoeBlock(args)
+        else:
+            self.mlp = MLP(args.hidden_size, args.intermediate_size)
 
     def __call__(
         self,
@@ -170,7 +170,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         return out
 
 
-class Qwen2MoeModel(nn.Module):
+class Qwen3MoeModel(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
@@ -179,7 +179,8 @@ class Qwen2MoeModel(nn.Module):
         assert self.vocab_size > 0
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
-            Qwen2MoeDecoderLayer(args=args) for _ in range(args.num_hidden_layers)
+            Qwen3MoeDecoderLayer(args=args, layer_idx=i)
+            for i in range(args.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
@@ -208,7 +209,7 @@ class Model(nn.Module):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
-        self.model = Qwen2MoeModel(args)
+        self.model = Qwen3MoeModel(args)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
     def __call__(
@@ -226,13 +227,12 @@ class Model(nn.Module):
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
             for n in ["up_proj", "down_proj", "gate_proj"]:
-                for k in ["weight", "scales", "biases"]:
-                    if f"{prefix}.mlp.experts.0.{n}.{k}" in weights:
-                        to_join = [
-                            weights.pop(f"{prefix}.mlp.experts.{e}.{n}.{k}")
-                            for e in range(self.args.num_experts)
-                        ]
-                        weights[f"{prefix}.mlp.switch_mlp.{n}.{k}"] = mx.stack(to_join)
+                if f"{prefix}.mlp.experts.0.{n}.weight" in weights:
+                    to_join = [
+                        weights.pop(f"{prefix}.mlp.experts.{e}.{n}.weight")
+                        for e in range(self.args.num_experts)
+                    ]
+                    weights[f"{prefix}.mlp.switch_mlp.{n}.weight"] = mx.stack(to_join)
         return weights
 
     @property

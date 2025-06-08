@@ -1,12 +1,13 @@
 # Copyright © 2025 Apple Inc.
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import BaseModelArgs, create_attention_mask
+from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
 
 
@@ -88,9 +89,8 @@ class Attention(nn.Module):
         # Sliding window
         if isinstance(mask, mx.array) and mask.shape[-1] != keys.shape[-2]:
             mask = mask[..., -keys.shape[-2] :]
-
-        output = mx.fast.scaled_dot_product_attention(
-            queries, keys, values, scale=self.scale, mask=mask
+        output = scaled_dot_product_attention(
+            queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
@@ -117,6 +117,16 @@ class MLP(nn.Module):
         return self.down_proj(nn.gelu_approx(self.gate_proj(x)) * self.up_proj(x))
 
 
+@partial(mx.compile, shapeless=True)
+def clip_residual(x, y):
+    if x.dtype != mx.float16:
+        return x + y
+    bound = mx.finfo(mx.float16).max
+    return mx.clip(x.astype(mx.float32) + y.astype(mx.float32), -bound, bound).astype(
+        mx.float16
+    )
+
+
 class TransformerBlock(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
@@ -140,9 +150,9 @@ class TransformerBlock(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         r = self.self_attn(self.input_layernorm(x), mask, cache)
-        h = x + self.post_attention_layernorm(r)
+        h = clip_residual(x, self.post_attention_layernorm(r))
         r = self.mlp(self.pre_feedforward_layernorm(h))
-        out = h + self.post_feedforward_layernorm(r)
+        out = clip_residual(h, self.post_feedforward_layernorm(r))
         return out
 
 
@@ -165,9 +175,12 @@ class Gemma3Model(nn.Module):
         inputs: mx.array,
         mask: mx.array = None,
         cache=None,
+        input_embeddings: Optional[mx.array] = None,
     ):
-
-        h = self.embed_tokens(inputs)
+        if input_embeddings is not None:
+            h = input_embeddings
+        else:
+            h = self.embed_tokens(inputs)
         h *= mx.array(self.args.hidden_size**0.5, mx.bfloat16).astype(h.dtype)
 
         if cache is None:
@@ -208,8 +221,9 @@ class Model(nn.Module):
         inputs: mx.array,
         cache=None,
         mask: Optional[mx.array] = None,
+        input_embeddings: Optional[mx.array] = None,
     ):
-        out = self.model(inputs, mask, cache)
+        out = self.model(inputs, mask, cache, input_embeddings)
         out = self.lm_head(out)
         return out
 

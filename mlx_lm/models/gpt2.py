@@ -1,11 +1,10 @@
 # Copyright © 2023-2024 Apple Inc.
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 
@@ -133,14 +132,15 @@ class GPT2Model(nn.Module):
 
         hidden_states = self.wte(inputs)
 
-        mask = None
-        if hidden_states.shape[1] > 1:
+        offset = 0
+        if cache is not None and len(cache) > 0 and cache[0] is not None:
+            offset = cache[0].offset
 
-            position_ids = mx.array(np.arange(L))
-            hidden_states += self.wpe(position_ids)
+        position_ids = mx.arange(offset, offset + L)
+        hidden_states += self.wpe(position_ids)
 
-            if mask is None:
-                mask = create_attention_mask(hidden_states, cache)
+        if mask is None:
+            mask = create_attention_mask(hidden_states, cache)
 
         if cache is None:
             cache = [None] * len(self.h)

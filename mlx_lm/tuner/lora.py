@@ -20,7 +20,7 @@ class LoRALinear(nn.Module):
         # on linear and quantized linear
         output_dims, input_dims = linear.weight.shape
         if isinstance(linear, nn.QuantizedLinear):
-            input_dims *= 32 // linear.bits
+            input_dims = input_dims * 32 // linear.bits
         lora_lin = LoRALinear(
             input_dims=input_dims,
             output_dims=output_dims,
@@ -52,9 +52,8 @@ class LoRALinear(nn.Module):
         output_dims, input_dims = weight.shape
         fused_linear = nn.Linear(input_dims, output_dims, bias=bias)
 
-        lora_b = (self.scale * self.lora_b.T).astype(dtype)
-        lora_a = self.lora_a.T.astype(dtype)
-        fused_linear.weight = weight + lora_b @ lora_a
+        delta = ((self.scale * self.lora_b.T) @ self.lora_a.T).astype(dtype)
+        fused_linear.weight = weight + delta
         if bias:
             fused_linear.bias = linear.bias
 
@@ -203,7 +202,7 @@ class LoRAEmbedding(nn.Module):
     ):
         num_embeddings, dims = embedding.weight.shape
         if isinstance(embedding, nn.QuantizedEmbedding):
-            dims *= 32 // embedding.bits
+            dims = dims * 32 // embedding.bits
         lora_embedding = LoRAEmbedding(
             num_embeddings=num_embeddings,
             dims=dims,
