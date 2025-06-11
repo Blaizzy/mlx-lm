@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright 2023-2024 Apple Inc.
 
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Union
@@ -42,18 +42,18 @@ class Attention(nn.Module):
         dim = args.hidden_size
         self.n_heads = n_heads = args.num_attention_heads
         self.n_kv_heads = n_kv_heads = args.num_key_value_heads
-
+        self.n_rep = n_heads // n_kv_heads
         self.head_dim = head_dim = args.head_dim or args.hidden_size // n_heads
 
         self.scale = head_dim**-0.5
-        if hasattr(args, "attention_bias"):
-            attention_bias = args.attention_bias
-        else:
-            attention_bias = False
+        attention_bias = getattr(args, "attention_bias", False)
 
-        self.q_proj = BitLinear(dim, n_heads * head_dim, bias=attention_bias)
-        self.k_proj = BitLinear(dim, n_kv_heads * head_dim, bias=attention_bias)
-        self.v_proj = BitLinear(dim, n_kv_heads * head_dim, bias=attention_bias)
+        # Single QKV projection
+        self.qkv_proj = BitLinear(
+            dim,
+            (n_heads + 2 * n_kv_heads) * head_dim,
+            bias=attention_bias
+        )
         self.o_proj = BitLinear(n_heads * head_dim, dim, bias=attention_bias)
 
         self.rope = initialize_rope(
@@ -73,12 +73,19 @@ class Attention(nn.Module):
     ) -> mx.array:
         B, L, D = x.shape
 
-        queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        # Fused QKV projection
+        qkv = self.qkv_proj(x)
+        qkv = qkv.reshape(B, L, -1, self.head_dim)
 
-        # Prepare the queries, keys and values for the attention computation
-        queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
-        keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
-        values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        # Split into Q, K, V
+        q = qkv[:, :, :self.n_heads, :]
+        k = qkv[:, :, self.n_heads:self.n_heads + self.n_kv_heads, :]
+        v = qkv[:, :, self.n_heads + self.n_kv_heads:, :]
+
+        # Transpose for attention
+        queries = q.transpose(0, 2, 1, 3)
+        keys = k.transpose(0, 2, 1, 3)
+        values = v.transpose(0, 2, 1, 3)
 
         if cache is not None:
             queries = self.rope(queries, offset=cache.offset)
@@ -210,14 +217,54 @@ class Model(nn.Module):
         return out
 
     def sanitize(self, weights):
-        # Remove unused precomputed rotary freqs
-        weights = {
-            k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
-        }
-        if self.args.tie_word_embeddings:
-            weights.pop("lm_head.weight", None)
-        return weights
+        # Remove unused precomputed rotary freqs and handle QKV fusion
+        sanitized = {}
+        processed_layers = set()  # Track which layers we've already processed
 
+        for k, v in weights.items():
+            if "self_attn.rotary_emb.inv_freq" in k:
+                continue
+
+            if "self_attn" in k and ("o_proj" not in k and "attn_sub_norm" not in k):
+                # Extract layer prefix
+                prefix = k.split("self_attn")[0]
+
+                # Only process each layer once
+                if prefix not in processed_layers:
+                    processed_layers.add(prefix)
+
+                    # Handle QKV fusion for weights
+                    if f"{prefix}self_attn.q_proj.weight" in weights:
+                        q = weights[f"{prefix}self_attn.q_proj.weight"]
+                        k_weight = weights[f"{prefix}self_attn.k_proj.weight"]
+                        v = weights[f"{prefix}self_attn.v_proj.weight"]
+                        qkv = mx.concatenate([q, k_weight, v], axis=0)
+                        sanitized[f"{prefix}self_attn.qkv_proj.weight"] = qkv
+
+                    # Handle weight scales if they exist
+                    if f"{prefix}self_attn.q_proj.weight_scale" in weights:
+                        q_scale = weights[f"{prefix}self_attn.q_proj.weight_scale"]
+                        k_scale = weights[f"{prefix}self_attn.k_proj.weight_scale"]
+                        v_scale = weights[f"{prefix}self_attn.v_proj.weight_scale"]
+                        qkv_scale = mx.sqrt((q_scale**2 + k_scale**2 + v_scale**2) / 3) # Root mean square
+                        sanitized[f"{prefix}self_attn.qkv_proj.weight_scale"] = qkv_scale
+
+                    # Handle biases if they exist
+                    if f"{prefix}self_attn.q_proj.bias" in weights:
+                        q_bias = weights[f"{prefix}self_attn.q_proj.bias"]
+                        k_bias = weights[f"{prefix}self_attn.k_proj.bias"]
+                        v_bias = weights[f"{prefix}self_attn.v_proj.bias"]
+                        qkv_bias = mx.concatenate([q_bias, k_bias, v_bias], axis=0)
+                        sanitized[f"{prefix}self_attn.qkv_proj.bias"] = qkv_bias
+
+                # Skip the individual q/k/v components since we've fused them
+                continue
+            else:
+                sanitized[k] = v
+
+        if self.args.tie_word_embeddings:
+            sanitized.pop("lm_head.weight", None)
+        return sanitized
     @property
     def layers(self):
         return self.model.layers
