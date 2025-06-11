@@ -75,17 +75,15 @@ class Attention(nn.Module):
 
         # Fused QKV projection
         qkv = self.qkv_proj(x)
-        qkv = qkv.reshape(B, L, -1, self.head_dim)
+        query_pos = self.n_heads * self.head_dim
+        queries, keys, values = mx.split(
+            qkv, [query_pos, query_pos + self.n_kv_heads * self.head_dim], axis=-1
+        )
 
-        # Split into Q, K, V
-        q = qkv[:, :, :self.n_heads, :]
-        k = qkv[:, :, self.n_heads:self.n_heads + self.n_kv_heads, :]
-        v = qkv[:, :, self.n_heads + self.n_kv_heads:, :]
-
-        # Transpose for attention
-        queries = q.transpose(0, 2, 1, 3)
-        keys = k.transpose(0, 2, 1, 3)
-        values = v.transpose(0, 2, 1, 3)
+        # Prepare the queries, keys and values for the attention computation
+        queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
+        keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
         if cache is not None:
             queries = self.rope(queries, offset=cache.offset)
