@@ -244,8 +244,8 @@ class Model(nn.Module):
                         q_scale = weights[f"{prefix}self_attn.q_proj.weight_scale"]
                         k_scale = weights[f"{prefix}self_attn.k_proj.weight_scale"]
                         v_scale = weights[f"{prefix}self_attn.v_proj.weight_scale"]
-                        qkv_scale = mx.sqrt((q_scale**2 + k_scale**2 + v_scale**2) / 3) # Root mean square
-                        sanitized[f"{prefix}self_attn.qkv_proj.weight_scale"] = qkv_scale
+                        # qkv_scale = mx.sqrt((q_scale**2 + k_scale**2 + v_scale**2) / 3) # Root mean square
+                        sanitized[f"{prefix}self_attn.qkv_proj.weight_scale"] = mx.concatenate([q_scale, k_scale, v_scale], axis=0)
 
                     # Handle biases if they exist
                     if f"{prefix}self_attn.q_proj.bias" in weights:

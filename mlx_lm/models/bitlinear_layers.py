@@ -1,12 +1,16 @@
+from typing import Any, Optional
+
 import mlx.core as mx
 import mlx.nn as nn
 
+from .base import BaseModelArgs, scaled_dot_product_attention
+from .rope_utils import initialize_rope
 
 class BitLinear(nn.Module):
     """
     BitLinear module with memory-efficient weight handling.
     """
-    def __init__(self, in_features, out_features, bias=True, dtype=mx.float16, invert_weight_scales = False):
+    def __init__(self, in_features, out_features, bias=True, dtype=mx.float16, invert_weight_scales = False, fused_shapes = None):
         super().__init__()
         self.dtype = dtype
         self.in_features = in_features
@@ -18,7 +22,14 @@ class BitLinear(nn.Module):
         self.weight = mx.zeros((packed_out_features, in_features), dtype=mx.uint8)
 
         self.invert_weight_scales = invert_weight_scales
-        self.weight_scale = mx.array([1.0], dtype=dtype)
+        self.fused_shapes = fused_shapes
+
+        if fused_shapes is None:
+            self.weight_scale = mx.array([1.0], dtype=dtype)
+        else:
+            self.weight_scale = mx.array([1.0] * (len(fused_shapes) + 1), dtype=dtype)
+
+        self.fused_layers = fused_shapes is not None
 
         if bias:
             self.bias = mx.zeros((out_features,), dtype=dtype)
@@ -70,10 +81,14 @@ class BitLinear(nn.Module):
         }
 
         // Apply weight scaling by diving them or multiplying them
-        if (invert_weight_scales) {
-            out[tid] = sum / weight_scale[0];
+        if (fused_layers) {
+            out[tid] = sum;
         } else {
-            out[tid] = sum * weight_scale[0];
+            if (invert_weight_scales) {
+                out[tid] = sum / weight_scale[0];
+            } else {
+                out[tid] = sum * weight_scale[0];
+            }
         }
         """
 
@@ -94,19 +109,36 @@ class BitLinear(nn.Module):
         if self._compiled_kernel is None:
             self._compiled_kernel = mx.fast.metal_kernel(
                 name="bitlinear_matmul",
-                input_names=["x", "packed_weights", "weight_scale", "invert_weight_scales"],
+                input_names=["x", "packed_weights", "weight_scale", "invert_weight_scales", "fused_layers"],
                 output_names=["out"],
                 source=source,
             )
 
         outputs = self._compiled_kernel(
-            inputs=[x_flattened.astype(self.dtype), packed_weights, self.weight_scale, self.invert_weight_scales],
+            inputs=[x_flattened.astype(self.dtype), packed_weights, self.weight_scale, self.invert_weight_scales, self.fused_layers],
             template=[("batch_size", total_batch_elements), ("in_features", in_features), ("out_features", out_features)],
             grid=(total_batch_elements * out_features, 1, 1),
             threadgroup=(min(256, total_batch_elements * out_features), 1, 1),
             output_shapes=[(total_batch_elements, out_features)],
             output_dtypes=[self.dtype],
         )
+        
+        if self.fused_layers:
+
+            # First split the output into the number of fused shapes
+            fused_outputs = mx.split(
+                outputs[0], self.fused_shapes, axis=-1
+            )
+            # then apply the weight scaling to each output
+            for i in range(len(fused_outputs)):
+                if self.invert_weight_scales:
+                    fused_outputs[i] = fused_outputs[i] / self.weight_scale[i]
+                else:
+                    fused_outputs[i] = fused_outputs[i] * self.weight_scale[i]
+            
+            # concat all outputs
+            outputs[0] = mx.concatenate(fused_outputs, axis=-1)
+            
 
         # Reshape output back to match input shape but with out_features as last dimension
         if len(original_shape) > 2:
@@ -131,3 +163,72 @@ class BitLinear(nn.Module):
 
         return y.astype(org_dtype)
     
+
+class BitLinearFusedAttention(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+
+        dim = args.hidden_size
+        self.n_heads = n_heads = args.num_attention_heads
+        self.n_kv_heads = n_kv_heads = args.num_key_value_heads
+
+        self.head_dim = head_dim = args.head_dim or args.hidden_size // n_heads
+
+        self.scale = head_dim**-0.5
+
+        if hasattr(args, "attention_bias"):
+            attention_bias = args.attention_bias
+        else:
+            attention_bias = False
+
+        query_pos = n_heads * head_dim
+
+        self.qkv_proj = BitLinear(
+            dim,
+            (n_heads + 2 * n_kv_heads) * head_dim,
+            bias=attention_bias,
+            fused_shapes=[query_pos, query_pos + self.n_kv_heads * self.head_dim],
+        )
+        self.o_proj = BitLinear(n_heads * head_dim, dim, bias=attention_bias)
+
+        self.rope = initialize_rope(
+            self.head_dim,
+            args.rope_theta,
+            args.rope_traditional,
+            args.rope_scaling,
+            args.max_position_embeddings,
+        )
+
+    def __call__(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        B, L, D = x.shape
+        
+        qkv = self.qkv_proj(x)
+        query_pos = self.n_heads * self.head_dim
+        queries, keys, values = mx.split(
+            qkv, [query_pos, query_pos + self.n_kv_heads * self.head_dim], axis=-1
+        )
+
+        # Prepare the queries, keys and values for the attention computation
+        queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
+        keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+
+        if cache is not None:
+            queries = self.rope(queries, offset=cache.offset)
+            keys = self.rope(keys, offset=cache.offset)
+            keys, values = cache.update_and_fetch(keys, values)
+        else:
+            queries = self.rope(queries)
+            keys = self.rope(keys)
+
+        output = scaled_dot_product_attention(
+            queries, keys, values, cache=cache, scale=self.scale, mask=mask
+        )
+
+        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        return self.o_proj(output)
