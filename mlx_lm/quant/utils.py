@@ -54,7 +54,7 @@ def replace_linear_with_quant_linear(model, quant_method = "bitnet", modules_to_
             # Replace Attention layers with BitLinearFusedAttention
             from mlx_lm.models.bitlinear_layers import BitLinearFusedAttention
 
-            new_module = BitLinearFusedAttention(model.args)
+            new_module = BitLinearFusedAttention(model.args, invert_weight_scales=True)
             quantize_layers.append((name, new_module))
     if len(quantize_layers) > 0:
         model.update_modules(tree_unflatten(quantize_layers))
@@ -90,7 +90,7 @@ def bitnet_sanitze(model, weights):
                     q_scale = weights[f"{prefix}self_attn.q_proj.weight_scale"]
                     k_scale = weights[f"{prefix}self_attn.k_proj.weight_scale"]
                     v_scale = weights[f"{prefix}self_attn.v_proj.weight_scale"]
-                    # qkv_scale = mx.sqrt((q_scale**2 + k_scale**2 + v_scale**2) / 3) # Root mean square
+                    
                     sanitized[f"{prefix}self_attn.qkv_proj.weight_scale"] = mx.concatenate([q_scale, k_scale, v_scale], axis=0)
 
                 # Handle biases if they exist

@@ -80,15 +80,22 @@ class BitLinear(nn.Module):
             sum += x_val * weight_val;
         }
 
+        uint weight_layer_idx = 0;  // Single layer case without any fusing
+
         // Apply weight scaling by diving them or multiplying them
-        if (fused_layers) {
-            out[tid] = sum;
-        } else {
-            if (invert_weight_scales) {
-                out[tid] = sum / weight_scale[0];
-            } else {
-                out[tid] = sum * weight_scale[0];
+        if (fused_length > 0) {
+            // determine the index by checking the interval which weight_layer_idx belongs to
+            for (uint i = 0; i < fused_length; i++) {
+                if (out_idx < fused_shapes[i]) {
+                    weight_layer_idx = i;
+                }
             }
+        }
+
+        if (invert_weight_scales) {
+            out[tid] = sum / weight_scale[weight_layer_idx];
+        } else {
+            out[tid] = sum * weight_scale[weight_layer_idx];
         }
         """
 
@@ -109,36 +116,27 @@ class BitLinear(nn.Module):
         if self._compiled_kernel is None:
             self._compiled_kernel = mx.fast.metal_kernel(
                 name="bitlinear_matmul",
-                input_names=["x", "packed_weights", "weight_scale", "invert_weight_scales", "fused_layers"],
+                input_names=["x", "packed_weights", "weight_scale", "invert_weight_scales", "fused_shapes", "fused_length"],
                 output_names=["out"],
                 source=source,
             )
 
+        if self.fused_layers:
+            self.fused_shapes.append(out_features)
+            inputs = [x_flattened.astype(self.dtype), packed_weights, self.weight_scale, self.invert_weight_scales,  mx.array(self.fused_shapes), len(self.fused_shapes)]
+        else:
+            inputs = [x_flattened.astype(self.dtype), packed_weights, self.weight_scale, self.invert_weight_scales, mx.array([]), 0]
+
+        # import pdb; pdb.set_trace()
+
         outputs = self._compiled_kernel(
-            inputs=[x_flattened.astype(self.dtype), packed_weights, self.weight_scale, self.invert_weight_scales, self.fused_layers],
+            inputs=inputs,
             template=[("batch_size", total_batch_elements), ("in_features", in_features), ("out_features", out_features)],
             grid=(total_batch_elements * out_features, 1, 1),
-            threadgroup=(min(256, total_batch_elements * out_features), 1, 1),
+            threadgroup=(min(32, total_batch_elements * out_features), 1, 1),
             output_shapes=[(total_batch_elements, out_features)],
             output_dtypes=[self.dtype],
         )
-        
-        if self.fused_layers:
-
-            # First split the output into the number of fused shapes
-            fused_outputs = mx.split(
-                outputs[0], self.fused_shapes, axis=-1
-            )
-            # then apply the weight scaling to each output
-            for i in range(len(fused_outputs)):
-                if self.invert_weight_scales:
-                    fused_outputs[i] = fused_outputs[i] / self.weight_scale[i]
-                else:
-                    fused_outputs[i] = fused_outputs[i] * self.weight_scale[i]
-            
-            # concat all outputs
-            outputs[0] = mx.concatenate(fused_outputs, axis=-1)
-            
 
         # Reshape output back to match input shape but with out_features as last dimension
         if len(original_shape) > 2:
@@ -165,7 +163,7 @@ class BitLinear(nn.Module):
     
 
 class BitLinearFusedAttention(nn.Module):
-    def __init__(self, args):
+    def __init__(self, args, invert_weight_scales: bool = True):
         super().__init__()
 
         dim = args.hidden_size
@@ -188,8 +186,14 @@ class BitLinearFusedAttention(nn.Module):
             (n_heads + 2 * n_kv_heads) * head_dim,
             bias=attention_bias,
             fused_shapes=[query_pos, query_pos + self.n_kv_heads * self.head_dim],
+            invert_weight_scales=invert_weight_scales
         )
-        self.o_proj = BitLinear(n_heads * head_dim, dim, bias=attention_bias)
+        self.o_proj = BitLinear(
+            n_heads * head_dim, 
+            dim, 
+            bias=attention_bias, 
+            invert_weight_scales=invert_weight_scales
+        )
 
         self.rope = initialize_rope(
             self.head_dim,
