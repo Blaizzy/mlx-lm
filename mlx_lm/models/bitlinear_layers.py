@@ -58,13 +58,13 @@ class BitLinear(nn.Module):
         // Calculate packed dimensions
         uint packed_rows = out_features / 4;  // Each packed row contains 4 output rows
 
+        // Determine which packed row and which bit position within that packed value
+        uint which_slice = out_idx / packed_rows;  // Which of the 4 slices (0, 1, 2, 3)
+        uint row_in_slice = out_idx % packed_rows;  // Which row within that slice
+        
         for (uint i = 0; i < in_features; i++) {
             // Get input value
             float x_val = x[batch_idx * in_features + i];
-
-            // Determine which packed row and which bit position within that packed value
-            uint which_slice = out_idx / packed_rows;  // Which of the 4 slices (0, 1, 2, 3)
-            uint row_in_slice = out_idx % packed_rows;  // Which row within that slice
 
             // Get the packed weight value
             uint packed_idx = row_in_slice * in_features + i;
@@ -88,6 +88,7 @@ class BitLinear(nn.Module):
             for (uint i = 0; i < fused_length; i++) {
                 if (out_idx < fused_shapes[i]) {
                     weight_layer_idx = i;
+                    break;
                 }
             }
         }
@@ -126,8 +127,6 @@ class BitLinear(nn.Module):
             inputs = [x_flattened.astype(self.dtype), packed_weights, self.weight_scale, self.invert_weight_scales,  mx.array(self.fused_shapes), len(self.fused_shapes)]
         else:
             inputs = [x_flattened.astype(self.dtype), packed_weights, self.weight_scale, self.invert_weight_scales, mx.array([]), 0]
-
-        # import pdb; pdb.set_trace()
 
         outputs = self._compiled_kernel(
             inputs=inputs,
@@ -216,7 +215,6 @@ class BitLinearFusedAttention(nn.Module):
         queries, keys, values = mx.split(
             qkv, [query_pos, query_pos + self.n_kv_heads * self.head_dim], axis=-1
         )
-
         # Prepare the queries, keys and values for the attention computation
         queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
         keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)

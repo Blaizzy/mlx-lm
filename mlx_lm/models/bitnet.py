@@ -48,11 +48,14 @@ class Attention(nn.Module):
         self.scale = head_dim**-0.5
         attention_bias = getattr(args, "attention_bias", False)
 
+        query_pos = n_heads * head_dim
+
         # Single QKV projection
         self.qkv_proj = BitLinear(
             dim,
             (n_heads + 2 * n_kv_heads) * head_dim,
-            bias=attention_bias
+            bias=attention_bias,
+            fused_shapes=[query_pos, query_pos + self.n_kv_heads * self.head_dim],
         )
         self.o_proj = BitLinear(n_heads * head_dim, dim, bias=attention_bias)
 

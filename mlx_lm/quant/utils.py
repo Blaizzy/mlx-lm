@@ -80,9 +80,10 @@ def bitnet_sanitze(model, weights):
                 # Handle QKV fusion for weights
                 if f"{prefix}self_attn.q_proj.weight" in weights:
                     q = weights[f"{prefix}self_attn.q_proj.weight"]
-                    k_weight = weights[f"{prefix}self_attn.k_proj.weight"]
+                    k = weights[f"{prefix}self_attn.k_proj.weight"]
                     v = weights[f"{prefix}self_attn.v_proj.weight"]
-                    qkv = mx.concatenate([q, k_weight, v], axis=0)
+                    # import pdb; pdb.set_trace()
+                    qkv = mx.concatenate([q, k, v], axis=0)
                     sanitized[f"{prefix}self_attn.qkv_proj.weight"] = qkv
 
                 # Handle weight scales if they exist
@@ -90,7 +91,6 @@ def bitnet_sanitze(model, weights):
                     q_scale = weights[f"{prefix}self_attn.q_proj.weight_scale"]
                     k_scale = weights[f"{prefix}self_attn.k_proj.weight_scale"]
                     v_scale = weights[f"{prefix}self_attn.v_proj.weight_scale"]
-                    
                     sanitized[f"{prefix}self_attn.qkv_proj.weight_scale"] = mx.concatenate([q_scale, k_scale, v_scale], axis=0)
 
                 # Handle biases if they exist
