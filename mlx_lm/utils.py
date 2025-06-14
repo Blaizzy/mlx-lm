@@ -42,7 +42,7 @@ from .tuner.utils import dequantize as dequantize_model
 from .tuner.utils import get_total_parameters, load_adapters
 
 # Quant imports
-from .quant.utils import replace_linear_with_quant_linear
+from .quant.utils import replace_linear_with_quant_linear, bitnet_sanitze
 
 # Constants
 MODEL_REMAPPING = {
@@ -213,12 +213,16 @@ def load_model(
         modules_to_not_convert = quantization_config.get("modules_to_not_convert", None)
 
         if quant_method is not None and quant_method in SUPPORTED_HF_QUANTIZATIONS:
+            fuse_qkv = True
             # Replace linear layers with quantized versions
             model = replace_linear_with_quant_linear(
                 model,
                 quant_method=quant_method,
-                modules_to_not_convert=modules_to_not_convert
+                modules_to_not_convert=modules_to_not_convert,
+                fuse_qkv=fuse_qkv
             )
+            if fuse_qkv:
+                weights = bitnet_sanitze(model, weights)
 
     model.load_weights(list(weights.items()), strict=strict)
 
