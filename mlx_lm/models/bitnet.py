@@ -217,7 +217,7 @@ class Model(nn.Module):
 
     def sanitize(self, weights):
         # Remove unused precomputed rotary freqs and handle QKV fusion
-        sanitized = {}
+        sanitized_weights = {}
         processed_layers = set()  # Track which layers we've already processed
 
         for k, v in weights.items():
@@ -238,7 +238,7 @@ class Model(nn.Module):
                         k = weights[f"{prefix}self_attn.k_proj.weight"]
                         v = weights[f"{prefix}self_attn.v_proj.weight"]
                         qkv = mx.concatenate([q, k, v], axis=0)
-                        sanitized[f"{prefix}self_attn.qkv_proj.weight"] = qkv
+                        sanitized_weights[f"{prefix}self_attn.qkv_proj.weight"] = qkv
 
                     # Handle weight scales if they exist
                     if f"{prefix}self_attn.q_proj.weight_scale" in weights:
@@ -246,7 +246,7 @@ class Model(nn.Module):
                         k_scale = weights[f"{prefix}self_attn.k_proj.weight_scale"]
                         v_scale = weights[f"{prefix}self_attn.v_proj.weight_scale"]
 
-                        sanitized[f"{prefix}self_attn.qkv_proj.weight_scale"] = mx.concatenate([q_scale, k_scale, v_scale], axis=0)
+                        sanitized_weights[f"{prefix}self_attn.qkv_proj.weight_scale"] = mx.concatenate([q_scale, k_scale, v_scale], axis=0)
 
 
                     # Handle biases if they exist
@@ -255,16 +255,16 @@ class Model(nn.Module):
                         k_bias = weights[f"{prefix}self_attn.k_proj.bias"]
                         v_bias = weights[f"{prefix}self_attn.v_proj.bias"]
                         qkv_bias = mx.concatenate([q_bias, k_bias, v_bias], axis=0)
-                        sanitized[f"{prefix}self_attn.qkv_proj.bias"] = qkv_bias
+                        sanitized_weights[f"{prefix}self_attn.qkv_proj.bias"] = qkv_bias
 
                 # Skip the individual q/k/v components since we've fused them
                 continue
             else:
-                sanitized[k] = v
+                sanitized_weights[k] = v
 
         if self.args.tie_word_embeddings:
-            sanitized.pop("lm_head.weight", None)
-        return sanitized
+            sanitized_weights.pop("lm_head.weight", None)
+        return sanitized_weights
     @property
     def layers(self):
         return self.model.layers
