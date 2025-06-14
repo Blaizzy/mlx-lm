@@ -35,7 +35,7 @@ class BitLinear(nn.Module):
         self._compiled_kernel = None
         self._compiled_qkv_kernel = None
 
-    def bitlinear_kernel(self, x, packed_weights, out_features=None):
+    def bitlinear_kernel(self, x, packed_weights, out_features=None, scale=None):
         """
         Custom Metal kernel that performs matrix multiplication directly on packed weights and scales the output.
         This eliminates the need to store unpacked weights in memory.
@@ -107,10 +107,10 @@ class BitLinear(nn.Module):
             )
 
         outputs = self._compiled_kernel(
-            inputs=[x_flattened.astype(self.dtype), packed_weights, self.weight_scale, self.invert_weight_scales],
+            inputs=[x_flattened.astype(self.dtype), packed_weights, scale, self.invert_weight_scales],
             template=[("batch_size", total_batch_elements), ("in_features", in_features), ("out_features", out_features)],
             grid=(total_batch_elements * out_features, 1, 1),
-            threadgroup=(min(256, total_batch_elements * out_features), 1, 1),
+            threadgroup=(min(32, total_batch_elements * out_features), 1, 1),
             output_shapes=[(total_batch_elements, out_features)],
             output_dtypes=[self.dtype],
         )
@@ -122,7 +122,138 @@ class BitLinear(nn.Module):
         else:
             return outputs[0]
 
+    def bitlinear_fused_qkv_kernel(self, x, packed_weights, scales):
+        """
+        Custom Metal kernel that performs fused QKV computation in parallel.
+        Handles Q (2560), K (640), V (640) outputs with their respective scales.
+        """
+        source = """
+        uint tid = thread_position_in_grid.x;
+        uint total_elements = batch_size * total_out_features;
 
+        if (tid >= total_elements) return;
+
+        uint batch_idx = tid / total_out_features;
+        uint out_idx = tid % total_out_features;
+
+        // Determine which component (Q, K, or V) this thread is computing
+        uint component;
+        uint local_out_idx;
+        uint component_start_idx;
+        uint component_out_features;
+        uint weight_slice_start;
+
+        if (out_idx < q_features) {
+            // Q component
+            component = 0;
+            local_out_idx = out_idx;
+            component_start_idx = 0;
+            component_out_features = q_features;
+            weight_slice_start = 0;
+        } else if (out_idx < q_features + k_features) {
+            // K component
+            component = 1;
+            local_out_idx = out_idx - q_features;
+            component_start_idx = q_features;
+            component_out_features = k_features;
+            weight_slice_start = q_packed_rows;
+        } else {
+            // V component
+            component = 2;
+            local_out_idx = out_idx - q_features - k_features;
+            component_start_idx = q_features + k_features;
+            component_out_features = v_features;
+            weight_slice_start = q_packed_rows + k_packed_rows;
+        }
+
+        float sum = 0.0;
+
+        // Calculate packed dimensions for this component
+        uint component_packed_rows = (component_out_features + 3) / 4;
+
+        for (uint i = 0; i < in_features; i++) {
+            // Get input value
+            float x_val = x[batch_idx * in_features + i];
+
+            // Determine which packed row and bit position within that packed value
+            uint which_slice = local_out_idx / component_packed_rows;
+            uint row_in_slice = local_out_idx % component_packed_rows;
+
+            // Calculate the actual packed weight index for this component
+            uint packed_idx = (weight_slice_start + row_in_slice) * in_features + i;
+            uint8_t packed_val = packed_weights[packed_idx];
+
+            // Extract the 2-bit value for this slice
+            uint8_t mask = 3 << (2 * which_slice);  // 0b11 shifted to the right position
+            uint8_t weight_bits = (packed_val & mask) >> (2 * which_slice);
+
+            // Convert from {0,1,2} back to {-1,0,1}
+            float weight_val = float(weight_bits) - 1.0;
+
+            sum += x_val * weight_val;
+        }
+
+        // Apply component-specific weight scaling
+        if (invert_weight_scales) {
+            out[tid] = sum / scales[component];
+        } else {
+            out[tid] = sum * scales[component];
+        }
+        """
+
+        # Handle multi-dimensional inputs by flattening all but the last dimension
+        original_shape = x.shape
+        if len(original_shape) > 2:
+            x_flattened = x.reshape(-1, original_shape[-1])
+            total_batch_elements = x_flattened.shape[0]
+            in_features = x_flattened.shape[1]
+        else:
+            x_flattened = x
+            total_batch_elements, in_features = x_flattened.shape
+
+        # QKV dimensions (based on your split points [640, 800])
+        q_features = 2560
+        k_features = 640
+        v_features = 640
+        total_out_features = q_features + k_features + v_features
+
+        # Calculate packed row counts for weight indexing
+        q_packed_rows = (q_features + 3) // 4
+        k_packed_rows = (k_features + 3) // 4
+
+        # Compile kernel once and cache it
+        if self._compiled_qkv_kernel is None:
+            self._compiled_qkv_kernel = mx.fast.metal_kernel(
+                name="bitlinear_fused_qkv",
+                input_names=["x", "packed_weights", "scales", "invert_weight_scales"],
+                output_names=["out"],
+                source=source,
+            )
+
+        outputs = self._compiled_qkv_kernel(
+            inputs=[x_flattened.astype(self.dtype), packed_weights, scales, self.invert_weight_scales],
+            template=[
+                ("batch_size", total_batch_elements),
+                ("in_features", in_features),
+                ("total_out_features", total_out_features),
+                ("q_features", q_features),
+                ("k_features", k_features),
+                ("v_features", v_features),
+                ("q_packed_rows", q_packed_rows),
+                ("k_packed_rows", k_packed_rows)
+            ],
+            grid=(total_batch_elements * total_out_features, 1, 1),
+            threadgroup=(min(32, total_batch_elements * total_out_features), 1, 1),
+            output_shapes=[(total_batch_elements, total_out_features)],
+            output_dtypes=[self.dtype],
+        )
+
+        # Reshape output back to match input shape but with total_out_features as last dimension
+        if len(original_shape) > 2:
+            output_shape = original_shape[:-1] + (total_out_features,)
+            return outputs[0].reshape(output_shape)
+        else:
+            return outputs[0]
 
     def __call__(self, x):
         """
@@ -132,32 +263,9 @@ class BitLinear(nn.Module):
 
         # Choose the appropriate kernel based on whether this is fused QKV
         if self.fuse_qkv:
-            # Split the computation into separate Q, K, V using the normal kernel
-            assert self.out_features % 3 == 0, "For fused QKV, out_features must be divisible by 3"
-
-            print(self.weight.shape)
-            q, k, v = mx.split(self.weight, [640, 800], axis=0)
-
-            # Split the scales
-            q_scale = mx.array([self.weight_scale[0]], dtype=self.dtype)
-            k_scale = mx.array([self.weight_scale[1]], dtype=self.dtype)
-            v_scale = mx.array([self.weight_scale[2]], dtype=self.dtype)
-
-            # Compute each component
-            self.weight_scale = q_scale
-            q_out = self.bitlinear_kernel(x, q, out_features=2560)
-
-            self.weight_scale = k_scale
-            k_out = self.bitlinear_kernel(x, k, out_features=640)
-
-            self.weight_scale = v_scale
-            v_out = self.bitlinear_kernel(x, v, out_features=640)
-
-            # Concatenate Q, K, V outputs along the last dimension
-            y = mx.concatenate([q_out, k_out, v_out], axis=-1)
-
+            y = self.bitlinear_fused_qkv_kernel(x, self.weight, self.weight_scale)
         else:
-            y = self.bitlinear_kernel(x, self.weight)
+            y = self.bitlinear_kernel(x, self.weight, scale=self.weight_scale)
 
         # Add bias if present
         if self.bias is not None:
