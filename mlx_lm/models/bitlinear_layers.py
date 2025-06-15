@@ -29,9 +29,7 @@ class BitLinear(nn.Module):
         else:
             self.bias = None
 
-        self._compiled_kernel = self._compile_matmul_kernel()
-        self._compiled_qkv_kernel = (
-            self._compile_qkv_kernel() if fused_qkv else None)
+        self._compiled_kernel = self._compile_qkv_kernel() if fused_qkv else self._compile_matmul_kernel()
 
 
     def _compile_matmul_kernel(self):
@@ -170,7 +168,7 @@ class BitLinear(nn.Module):
         total = q + k + v
         q_pack = (q + 3) // 4; k_pack = (k + 3) // 4
 
-        out = self._compiled_qkv_kernel(
+        out = self._compiled_kernel(
             inputs=[x_flat.astype(self.dtype), packed_weights, self.weight_scale, self.invert_weight_scales],
             template=[
                 ("batch_size", batches), ("in_features", in_feat),
