@@ -51,9 +51,12 @@ class Attention(nn.Module):
         else:
             attention_bias = False
 
-        self.q_proj = BitLinear(dim, n_heads * head_dim, bias=attention_bias)
-        self.k_proj = BitLinear(dim, n_kv_heads * head_dim, bias=attention_bias)
-        self.v_proj = BitLinear(dim, n_kv_heads * head_dim, bias=attention_bias)
+        self.qkv_proj = BitLinear(
+            dim,
+            (n_heads + 2 * n_kv_heads) * head_dim,
+            bias=attention_bias,
+            fused_qkv=True
+        )
         self.o_proj = BitLinear(n_heads * head_dim, dim, bias=attention_bias)
 
         self.rope = initialize_rope(
@@ -73,7 +76,19 @@ class Attention(nn.Module):
     ) -> mx.array:
         B, L, D = x.shape
 
-        queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        # Fused QKV projection
+        query_pos = self.n_heads * self.head_dim
+        kv_pos = self.n_kv_heads * self.head_dim
+
+        kwargs = {
+            "query_position": query_pos,
+            "kv_position": kv_pos,
+        }
+        qkv = self.qkv_proj(x, **kwargs)
+
+        queries, keys, values = mx.split(
+            qkv, [query_pos, query_pos + kv_pos], axis=-1
+        )
 
         # Prepare the queries, keys and values for the attention computation
         queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
@@ -210,13 +225,55 @@ class Model(nn.Module):
         return out
 
     def sanitize(self, weights):
-        # Remove unused precomputed rotary freqs
-        weights = {
-            k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
-        }
+        # Remove unused precomputed rotary freqs and handle QKV fusion
+        sanitized_weights = {}
+        processed_layers = set()  # Track which layers we've already processed
+
+        for k, v in weights.items():
+            if "self_attn.rotary_emb.inv_freq" in k:
+                continue
+
+            if "self_attn" in k and ("o_proj" not in k and "attn_sub_norm" not in k):
+                # Extract layer prefix
+                prefix = k.split("self_attn")[0]
+
+                # Only process each layer once
+                if prefix not in processed_layers:
+                    processed_layers.add(prefix)
+
+                    # Handle QKV fusion for weights
+                    if f"{prefix}self_attn.q_proj.weight" in weights:
+                        q = weights[f"{prefix}self_attn.q_proj.weight"]
+                        k = weights[f"{prefix}self_attn.k_proj.weight"]
+                        v = weights[f"{prefix}self_attn.v_proj.weight"]
+                        qkv = mx.concatenate([q, k, v], axis=0)
+                        sanitized_weights[f"{prefix}self_attn.qkv_proj.weight"] = qkv
+
+                    # Handle weight scales if they exist
+                    if f"{prefix}self_attn.q_proj.weight_scale" in weights:
+                        q_scale = weights[f"{prefix}self_attn.q_proj.weight_scale"]
+                        k_scale = weights[f"{prefix}self_attn.k_proj.weight_scale"]
+                        v_scale = weights[f"{prefix}self_attn.v_proj.weight_scale"]
+
+                        sanitized_weights[f"{prefix}self_attn.qkv_proj.weight_scale"] = mx.concatenate([q_scale, k_scale, v_scale], axis=0)
+
+
+                    # Handle biases if they exist
+                    if f"{prefix}self_attn.q_proj.bias" in weights:
+                        q_bias = weights[f"{prefix}self_attn.q_proj.bias"]
+                        k_bias = weights[f"{prefix}self_attn.k_proj.bias"]
+                        v_bias = weights[f"{prefix}self_attn.v_proj.bias"]
+                        qkv_bias = mx.concatenate([q_bias, k_bias, v_bias], axis=0)
+                        sanitized_weights[f"{prefix}self_attn.qkv_proj.bias"] = qkv_bias
+
+                # Skip the individual q/k/v components since we've fused them
+                continue
+            else:
+                sanitized_weights[k] = v
+
         if self.args.tie_word_embeddings:
-            weights.pop("lm_head.weight", None)
-        return weights
+            sanitized_weights.pop("lm_head.weight", None)
+        return sanitized_weights
 
     @property
     def layers(self):

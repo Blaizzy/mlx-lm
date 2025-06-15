@@ -6,7 +6,7 @@ class BitLinear(nn.Module):
     """
     BitLinear module with memory-efficient weight handling.
     """
-    def __init__(self, in_features, out_features, bias=True, dtype=mx.float16, invert_weight_scales = False):
+    def __init__(self, in_features, out_features, bias=True, dtype=mx.float16, invert_weight_scales = False, fused_qkv = False):
         super().__init__()
         self.dtype = dtype
         self.in_features = in_features
@@ -18,7 +18,10 @@ class BitLinear(nn.Module):
         self.weight = mx.zeros((packed_out_features, in_features), dtype=mx.uint8)
 
         self.invert_weight_scales = invert_weight_scales
-        self.weight_scale = mx.array([1.0], dtype=dtype)
+        self.fused_qkv = fused_qkv
+
+        shape = [1.0, 1.0, 1.0] if fused_qkv else [1.0]
+        self.weight_scale = mx.array(shape, dtype=dtype)
 
         if bias:
             self.bias = mx.zeros((out_features,), dtype=dtype)
@@ -27,6 +30,7 @@ class BitLinear(nn.Module):
 
         # Compile kernel
         self._compiled_kernel = self.compile_matmul_kernel()
+        self._compiled_qkv_kernel = self.compile_qkv_kernel()
 
     def compile_matmul_kernel(self):
         """
@@ -77,6 +81,133 @@ class BitLinear(nn.Module):
             source=source,
         )
 
+    def compile_qkv_kernel(self):
+        """
+        Custom Metal kernel that performs fused QKV computation in parallel.
+        Handles Q, K, V outputs with their respective scales.
+        """
+        source = """
+        uint tid = thread_position_in_grid.x;
+        uint total_elements = batch_size * total_out_features;
+
+        if (tid >= total_elements) return;
+
+        uint batch_idx = tid / total_out_features;
+        uint out_idx = tid % total_out_features;
+
+        // Determine which component (Q, K, or V) this thread is computing
+        uint component;
+        uint local_out_idx;
+        uint component_start_idx;
+        uint component_out_features;
+        uint weight_slice_start;
+
+        if (out_idx < q_features) {
+            // Q component
+            component = 0;
+            local_out_idx = out_idx;
+            component_start_idx = 0;
+            component_out_features = q_features;
+            weight_slice_start = 0;
+        } else if (out_idx < q_features + k_features) {
+            // K component
+            component = 1;
+            local_out_idx = out_idx - q_features;
+            component_start_idx = q_features;
+            component_out_features = k_features;
+            weight_slice_start = q_packed_rows;
+        } else {
+            // V component
+            component = 2;
+            local_out_idx = out_idx - q_features - k_features;
+            component_start_idx = q_features + k_features;
+            component_out_features = v_features;
+            weight_slice_start = q_packed_rows + k_packed_rows;
+        }
+
+        float sum = 0.0;
+
+        // Calculate packed dimensions for this component
+        uint component_packed_rows = (component_out_features + 3) / 4;
+
+        for (uint i = 0; i < in_features; i++) {
+            // Get input value
+            float x_val = x[batch_idx * in_features + i];
+
+            // Determine which packed row and bit position within that packed value
+            uint which_slice = local_out_idx / component_packed_rows;
+            uint row_in_slice = local_out_idx - which_slice * component_packed_rows;
+
+            // Calculate the actual packed weight index for this component
+            uint packed_idx = (weight_slice_start + row_in_slice) * in_features + i;
+            uint8_t packed_val = packed_weights[packed_idx];
+
+            // Extract the 2-bit slice; {0,1,2} -> {-1,0,1} (11 is unused and would map to 2)
+            float weight_val = float((packed_val >> (2 * which_slice)) & 3) - 1.0;
+
+            sum += x_val * weight_val;
+        }
+
+        // Apply component-specific weight scaling
+        out[tid] = invert_weight_scales ? (sum / scales[component]) : (sum * scales[component]);
+        """
+
+        return mx.fast.metal_kernel(
+            name="bitlinear_fused_qkv",
+            input_names=["x", "packed_weights", "scales", "invert_weight_scales"],
+            output_names=["out"],
+            source=source,
+        )
+
+
+    def execute_fused_qkv_matmul_kernel(self, x: mx.array, packed_weights: mx.array, **kwargs) -> mx.array:
+        # Handle multi-dimensional inputs by flattening all but the last dimension
+        original_shape = x.shape
+        if len(original_shape) > 2:
+            x_flattened = x.reshape(-1, original_shape[-1])
+            total_batch_elements = x_flattened.shape[0]
+            in_features = x_flattened.shape[1]
+        else:
+            x_flattened = x
+            total_batch_elements, in_features = x_flattened.shape
+
+        # QKV dimensions (based on your split points [640, 800])
+        q_features = kwargs.get("query_position")
+        k_features = v_features = kwargs.get("kv_position")
+        if q_features is None or k_features is None:
+            raise ValueError("QKV kernel requires 'query_position' and 'kv_position' arguments")
+
+        total_out_features = q_features + k_features + v_features
+
+        # Calculate packed row counts for weight indexing
+        q_packed_rows = (q_features + 3) // 4
+        k_packed_rows = (k_features + 3) // 4
+
+        outputs = self._compiled_qkv_kernel(
+            inputs=[x_flattened.astype(self.dtype), packed_weights, self.weight_scale, self.invert_weight_scales],
+            template=[
+                ("batch_size", total_batch_elements),
+                ("in_features", in_features),
+                ("total_out_features", total_out_features),
+                ("q_features", q_features),
+                ("k_features", k_features),
+                ("v_features", v_features),
+                ("q_packed_rows", q_packed_rows),
+                ("k_packed_rows", k_packed_rows)
+            ],
+            grid=(total_batch_elements * total_out_features, 1, 1),
+            threadgroup=(32, 1, 1), # SIMD width is 32 threads
+            output_shapes=[(total_batch_elements, total_out_features)],
+            output_dtypes=[self.dtype],
+        )
+
+        # Reshape output back to match input shape but with total_out_features as last dimension
+        if len(original_shape) > 2:
+            output_shape = original_shape[:-1] + (total_out_features,)
+            return outputs[0].reshape(output_shape)
+        else:
+            return outputs[0]
+
 
     def execute_matmul_kernel(self, x, packed_weights):
         # Handle multi-dimensional inputs by flattening all but the last dimension
@@ -109,14 +240,17 @@ class BitLinear(nn.Module):
             return outputs[0]
 
 
-    def __call__(self, x):
+    def __call__(self, x: mx.array, **kwargs) -> mx.array:
         """
         Forward pass with weight scaling applied correctly.
         """
         org_dtype = x.dtype
 
         # Use custom kernel for matrix multiplication directly on packed weights
-        y = self.execute_matmul_kernel(x, self.weight)
+        if self.fused_qkv:
+            y = self.execute_fused_qkv_matmul_kernel(x, self.weight, **kwargs)
+        else:
+            y = self.execute_matmul_kernel(x, self.weight)
 
         # Add bias if present
         if self.bias is not None:
