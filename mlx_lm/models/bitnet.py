@@ -35,8 +35,8 @@ class ModelArgs(BaseModelArgs):
 
 
 
-class Attention(nn.Module):
-    def __init__(self, args: ModelArgs):
+class BitFusedAttention(nn.Module):
+    def __init__(self, args: ModelArgs, invert_weight_scales: bool = False, add_sub_norm: bool = True):
         super().__init__()
 
         dim = args.hidden_size
@@ -55,9 +55,10 @@ class Attention(nn.Module):
             dim,
             (n_heads + 2 * n_kv_heads) * head_dim,
             bias=attention_bias,
-            fused_qkv=True
+            fused_qkv=True,
+            invert_weight_scales=invert_weight_scales,
         )
-        self.o_proj = BitLinear(n_heads * head_dim, dim, bias=attention_bias)
+        self.o_proj = BitLinear(n_heads * head_dim, dim, bias=attention_bias, invert_weight_scales=invert_weight_scales)
 
         self.rope = initialize_rope(
             self.head_dim,
@@ -66,7 +67,9 @@ class Attention(nn.Module):
             args.rope_scaling,
             args.max_position_embeddings,
         )
-        self.attn_sub_norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.add_sub_norm = add_sub_norm
+        if self.add_sub_norm:
+            self.attn_sub_norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
     def __call__(
         self,
@@ -108,7 +111,8 @@ class Attention(nn.Module):
         )
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        output = self.attn_sub_norm(output)
+        if self.add_sub_norm:
+            output = self.attn_sub_norm(output)
         output = self.o_proj(output)
 
         return output
@@ -145,7 +149,7 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.num_attention_heads = args.num_attention_heads
         self.hidden_size = args.hidden_size
-        self.self_attn = Attention(args)
+        self.self_attn = BitFusedAttention(args)
         self.mlp = MLP(args)
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(

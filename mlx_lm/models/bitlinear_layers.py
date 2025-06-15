@@ -33,9 +33,7 @@ class BitLinear(nn.Module):
         else:
             self.bias = None
 
-        self._compiled_kernel = self._compile_matmul_kernel()
-        self._compiled_qkv_kernel = (
-            self._compile_qkv_kernel() if fused_qkv else None)
+        self._compiled_kernel = self._compile_qkv_kernel() if fused_qkv else self._compile_matmul_kernel()
 
 
     def _compile_matmul_kernel(self):
@@ -174,7 +172,7 @@ class BitLinear(nn.Module):
         total = q + k + v
         q_pack = (q + 3) // 4; k_pack = (k + 3) // 4
 
-        out = self._compiled_qkv_kernel(
+        out = self._compiled_kernel(
             inputs=[x_flat.astype(self.dtype), packed_weights, self.weight_scale, self.invert_weight_scales],
             template=[
                 ("batch_size", batches), ("in_features", in_feat),
@@ -207,7 +205,6 @@ class BitLinear(nn.Module):
             out = mx.add(out, self.bias)
         return out.astype(x.dtype)
 
-
     @staticmethod
     def benchmark():
         import time
@@ -224,84 +221,6 @@ class BitLinear(nn.Module):
             for _ in range(100): mx.eval(model(x))
             dt = (time.time() - t0) / 100
             print(f"{name:<16}: {dt*1e3:.1f} ms | {(bs*sl)/dt:,.0f} tok/s")
-
-
-class BitFusedAttention(nn.Module):
-    def __init__(self, args, invert_weight_scales=False):
-        super().__init__()
-
-        dim = args.hidden_size
-        self.n_heads = n_heads = args.num_attention_heads
-        self.n_kv_heads = n_kv_heads = args.num_key_value_heads
-
-        self.head_dim = head_dim = args.head_dim or args.hidden_size // n_heads
-
-        self.scale = head_dim**-0.5
-        if hasattr(args, "attention_bias"):
-            attention_bias = args.attention_bias
-        else:
-            attention_bias = False
-
-        self.qkv_proj = BitLinear(
-            dim,
-            (n_heads + 2 * n_kv_heads) * head_dim,
-            bias=attention_bias,
-            fused_qkv=True,
-            invert_weight_scales=invert_weight_scales,
-        )
-        self.o_proj = BitLinear(n_heads * head_dim, dim, bias=attention_bias, invert_weight_scales=invert_weight_scales)
-
-        self.rope = initialize_rope(
-            self.head_dim,
-            args.rope_theta,
-            args.rope_traditional,
-            args.rope_scaling,
-            args.max_position_embeddings,
-        )
-
-    def __call__(
-        self,
-        x: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
-    ) -> mx.array:
-        B, L, D = x.shape
-
-        # Fused QKV projection
-        query_pos = self.n_heads * self.head_dim
-        kv_pos = self.n_kv_heads * self.head_dim
-
-        kwargs = {
-            "query_position": query_pos,
-            "kv_position": kv_pos,
-        }
-        qkv = self.qkv_proj(x, **kwargs)
-
-        queries, keys, values = mx.split(
-            qkv, [query_pos, query_pos + kv_pos], axis=-1
-        )
-
-        # Prepare the queries, keys and values for the attention computation
-        queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
-        keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
-        values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
-
-        if cache is not None:
-            queries = self.rope(queries, offset=cache.offset)
-            keys = self.rope(keys, offset=cache.offset)
-            keys, values = cache.update_and_fetch(keys, values)
-        else:
-            queries = self.rope(queries)
-            keys = self.rope(keys)
-
-        output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
-        )
-
-        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        output = self.o_proj(output)
-
-        return output
 
 if __name__ == "__main__":
     BitLinear.benchmark()

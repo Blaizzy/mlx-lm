@@ -32,7 +32,7 @@ def load_data(tokenizer, num_samples: int, sequence_length: int) -> mx.array:
         segments = segments[:num_samples]
     return tokens[segments]
 
-def replace_linear_with_quant_linear(model, quant_method = "bitnet", modules_to_not_convert=None, fused_qkv=False):
+def replace_linear_with_quant_linear(model, quant_method = "bitnet", modules_to_not_convert=None, fused_qkv=True):
     quantize_layers = []
     for name, module in model.named_modules():     
         if modules_to_not_convert is None:
@@ -52,16 +52,16 @@ def replace_linear_with_quant_linear(model, quant_method = "bitnet", modules_to_
                 quantize_layers.append((name, new_layer))
         if fused_qkv and name not in modules_to_not_convert and module.__class__.__name__ == "Attention":
             # Replace Attention layers with BitLinearFusedAttention
-            from mlx_lm.models.bitlinear_layers import BitFusedAttention
+            from mlx_lm.models.bitnet import BitFusedAttention
 
-            new_module = BitFusedAttention(model.args, invert_weight_scales=True)
+            new_module = BitFusedAttention(model.args, invert_weight_scales=True, add_sub_norm=False)
             quantize_layers.append((name, new_module))
     if len(quantize_layers) > 0:
         model.update_modules(tree_unflatten(quantize_layers))
     return model
 
 
-def apply_hf_quantization(model, config, weights):
+def apply_hf_quantization(model, config, weights = None):
     """
     Apply HF quantization to a model if it has a quantization config.
     """
@@ -71,17 +71,13 @@ def apply_hf_quantization(model, config, weights):
         modules_to_not_convert = quantization_config.get("modules_to_not_convert", None)
 
         if quant_method is not None and quant_method in QUANT_LINEAR_MAPPING.keys():
-            # TODO: shall we make that configurable?
-            fused_qkv = True
             # Replace linear layers with quantized versions
             model = replace_linear_with_quant_linear(
                 model,
                 quant_method=quant_method,
                 modules_to_not_convert=modules_to_not_convert,
-                fused_qkv=fused_qkv
             )
-
-            if fused_qkv:
+            if weights is not None:
                 weights = bitnet_sanitze(model, weights)
 
     return model, weights
