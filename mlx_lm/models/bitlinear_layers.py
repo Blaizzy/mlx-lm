@@ -159,17 +159,20 @@ class BitLinear(nn.Module):
             source=source,
         )
 
-
-    def execute_fused_qkv_matmul_kernel(self, x: mx.array, packed_weights: mx.array, **kwargs) -> mx.array:
-        # Handle multi-dimensional inputs by flattening all but the last dimension
-        original_shape = x.shape
-        if len(original_shape) > 2:
-            x_flattened = x.reshape(-1, original_shape[-1])
+    def flatten_input(self, x: mx.array):
+        if len(x.shape) > 2:
+            x_flattened = x.reshape(-1, x.shape[-1])
             total_batch_elements = x_flattened.shape[0]
             in_features = x_flattened.shape[1]
         else:
             x_flattened = x
             total_batch_elements, in_features = x_flattened.shape
+        return x_flattened, total_batch_elements, in_features
+
+    def execute_fused_qkv_matmul_kernel(self, x: mx.array, packed_weights: mx.array, **kwargs) -> mx.array:
+        # Handle multi-dimensional inputs by flattening all but the last dimension
+        original_shape = x.shape
+        x_flattened, total_batch_elements, in_features = self.flatten_input(x)
 
         # QKV dimensions (based on your split points [640, 800])
         q_features = kwargs.get("query_position")
@@ -212,15 +215,7 @@ class BitLinear(nn.Module):
     def execute_matmul_kernel(self, x, packed_weights):
         # Handle multi-dimensional inputs by flattening all but the last dimension
         original_shape = x.shape
-        if len(original_shape) > 2:
-            # Flatten to (total_batch_elements, in_features)
-            x_flattened = x.reshape(-1, original_shape[-1])
-            total_batch_elements = x_flattened.shape[0]
-            in_features = x_flattened.shape[1]
-        else:
-            x_flattened = x
-            total_batch_elements, in_features = x_flattened.shape
-
+        x_flattened, total_batch_elements, in_features = self.flatten_input(x)
         out_features = self.out_features
 
         outputs = self._compiled_kernel(
