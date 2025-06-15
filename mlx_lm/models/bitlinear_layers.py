@@ -153,7 +153,7 @@ class BitLinear(nn.Module):
         """
 
         return mx.fast.metal_kernel(
-            name="bitlinear_fused_qkv",
+            name="bitlinear_fused_qkv_matmul",
             input_names=["x", "packed_weights", "scales", "invert_weight_scales"],
             output_names=["out"],
             source=source,
