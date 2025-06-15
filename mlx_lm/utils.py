@@ -203,7 +203,7 @@ def load_model(
         )
 
     # We can also handle HF-related quant models such as bitnet
-    model = apply_hf_quantization(model, config)
+    model, weights = apply_hf_quantization(model, config, weights)
 
     model.load_weights(list(weights.items()), strict=strict)
 
