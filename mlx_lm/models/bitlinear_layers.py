@@ -1,6 +1,10 @@
+from typing import Optional, Any
+
 import mlx.core as mx
 import mlx.nn as nn
 
+from .base import scaled_dot_product_attention
+from .rope_utils import initialize_rope
 
 class BitLinear(nn.Module):
     """
@@ -201,7 +205,6 @@ class BitLinear(nn.Module):
             out = mx.add(out, self.bias)
         return out.astype(x.dtype)
 
-
     @staticmethod
     def benchmark():
         import time
@@ -218,7 +221,6 @@ class BitLinear(nn.Module):
             for _ in range(100): mx.eval(model(x))
             dt = (time.time() - t0) / 100
             print(f"{name:<16}: {dt*1e3:.1f} ms | {(bs*sl)/dt:,.0f} tok/s")
-
 
 if __name__ == "__main__":
     BitLinear.benchmark()
