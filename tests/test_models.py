@@ -265,7 +265,7 @@ class TestModels(unittest.TestCase):
             },
         )
         model = llama.Model(args)
-        model = apply_hf_quantization(model, args.__dict__)
+        model = apply_hf_quantization(model, args.__dict__)[0]
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )

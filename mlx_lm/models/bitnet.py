@@ -35,8 +35,8 @@ class ModelArgs(BaseModelArgs):
 
 
 
-class Attention(nn.Module):
-    def __init__(self, args: ModelArgs):
+class BitFusedAttention(nn.Module):
+    def __init__(self, args: ModelArgs, invert_weight_scales: bool = False, add_sub_norm: bool = True):
         super().__init__()
 
         dim = args.hidden_size
@@ -51,10 +51,14 @@ class Attention(nn.Module):
         else:
             attention_bias = False
 
-        self.q_proj = BitLinear(dim, n_heads * head_dim, bias=attention_bias)
-        self.k_proj = BitLinear(dim, n_kv_heads * head_dim, bias=attention_bias)
-        self.v_proj = BitLinear(dim, n_kv_heads * head_dim, bias=attention_bias)
-        self.o_proj = BitLinear(n_heads * head_dim, dim, bias=attention_bias)
+        self.qkv_proj = BitLinear(
+            dim,
+            (n_heads + 2 * n_kv_heads) * head_dim,
+            bias=attention_bias,
+            fused_qkv=True,
+            invert_weight_scales=invert_weight_scales,
+        )
+        self.o_proj = BitLinear(n_heads * head_dim, dim, bias=attention_bias, invert_weight_scales=invert_weight_scales)
 
         self.rope = initialize_rope(
             self.head_dim,
@@ -63,7 +67,9 @@ class Attention(nn.Module):
             args.rope_scaling,
             args.max_position_embeddings,
         )
-        self.attn_sub_norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.add_sub_norm = add_sub_norm
+        if self.add_sub_norm:
+            self.attn_sub_norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
     def __call__(
         self,
@@ -73,7 +79,19 @@ class Attention(nn.Module):
     ) -> mx.array:
         B, L, D = x.shape
 
-        queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        # Fused QKV projection
+        query_pos = self.n_heads * self.head_dim
+        kv_pos = self.n_kv_heads * self.head_dim
+
+        kwargs = {
+            "query_position": query_pos,
+            "kv_position": kv_pos,
+        }
+        qkv = self.qkv_proj(x, **kwargs)
+
+        queries, keys, values = mx.split(
+            qkv, [query_pos, query_pos + kv_pos], axis=-1
+        )
 
         # Prepare the queries, keys and values for the attention computation
         queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
@@ -93,7 +111,8 @@ class Attention(nn.Module):
         )
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        output = self.attn_sub_norm(output)
+        if self.add_sub_norm:
+            output = self.attn_sub_norm(output)
         output = self.o_proj(output)
 
         return output
@@ -130,7 +149,7 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.num_attention_heads = args.num_attention_heads
         self.hidden_size = args.hidden_size
-        self.self_attn = Attention(args)
+        self.self_attn = BitFusedAttention(args)
         self.mlp = MLP(args)
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
@@ -210,13 +229,55 @@ class Model(nn.Module):
         return out
 
     def sanitize(self, weights):
-        # Remove unused precomputed rotary freqs
-        weights = {
-            k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
-        }
+        # Remove unused precomputed rotary freqs and handle QKV fusion
+        sanitized_weights = {}
+        processed_layers = set()  # Track which layers we've already processed
+
+        for k, v in weights.items():
+            if "self_attn.rotary_emb.inv_freq" in k:
+                continue
+
+            if "self_attn" in k and ("o_proj" not in k and "attn_sub_norm" not in k):
+                # Extract layer prefix
+                prefix = k.split("self_attn")[0]
+
+                # Only process each layer once
+                if prefix not in processed_layers:
+                    processed_layers.add(prefix)
+
+                    # Handle QKV fusion for weights
+                    if f"{prefix}self_attn.q_proj.weight" in weights:
+                        q = weights[f"{prefix}self_attn.q_proj.weight"]
+                        k = weights[f"{prefix}self_attn.k_proj.weight"]
+                        v = weights[f"{prefix}self_attn.v_proj.weight"]
+                        qkv = mx.concatenate([q, k, v], axis=0)
+                        sanitized_weights[f"{prefix}self_attn.qkv_proj.weight"] = qkv
+
+                    # Handle weight scales if they exist
+                    if f"{prefix}self_attn.q_proj.weight_scale" in weights:
+                        q_scale = weights[f"{prefix}self_attn.q_proj.weight_scale"]
+                        k_scale = weights[f"{prefix}self_attn.k_proj.weight_scale"]
+                        v_scale = weights[f"{prefix}self_attn.v_proj.weight_scale"]
+
+                        sanitized_weights[f"{prefix}self_attn.qkv_proj.weight_scale"] = mx.concatenate([q_scale, k_scale, v_scale], axis=0)
+
+
+                    # Handle biases if they exist
+                    if f"{prefix}self_attn.q_proj.bias" in weights:
+                        q_bias = weights[f"{prefix}self_attn.q_proj.bias"]
+                        k_bias = weights[f"{prefix}self_attn.k_proj.bias"]
+                        v_bias = weights[f"{prefix}self_attn.v_proj.bias"]
+                        qkv_bias = mx.concatenate([q_bias, k_bias, v_bias], axis=0)
+                        sanitized_weights[f"{prefix}self_attn.qkv_proj.bias"] = qkv_bias
+
+                # Skip the individual q/k/v components since we've fused them
+                continue
+            else:
+                sanitized_weights[k] = v
+
         if self.args.tie_word_embeddings:
-            weights.pop("lm_head.weight", None)
-        return weights
+            sanitized_weights.pop("lm_head.weight", None)
+        return sanitized_weights
 
     @property
     def layers(self):
