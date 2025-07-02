@@ -2,6 +2,7 @@ from typing import Optional, Any
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.layers.quantized import QuantizedLinear
 
 from .base import scaled_dot_product_attention
 from .rope_utils import initialize_rope
@@ -10,8 +11,15 @@ class BitLinear(nn.Module):
     """
     BitLinear module with memory-efficient weight handling.
     """
-    def __init__(self, in_features, out_features, *, bias=True, dtype=mx.float16,
-                 invert_weight_scales: bool = False, fused_qkv: bool = False):
+
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        bias=True,
+        dtype=mx.float16,
+        invert_weight_scales=False,
+    ):
         super().__init__()
         self.dtype = dtype
         self.in_features = in_features
@@ -41,49 +49,45 @@ class BitLinear(nn.Module):
         Custom Metal kernel that performs matrix multiplication directly on packed weights and scales the output.
         This eliminates the need to store unpacked weights in memory.
         """
-        source = r"""
-        using namespace metal;
-        uint tid = thread_position_in_grid.x;
-        if (tid >= batch_size * out_features) return;
+        source = """
+        constexpr int M = 4;
+        constexpr int BLOCK = 32;
 
-        uint batch_idx = tid / out_features;
-        uint out_idx   = tid % out_features;
+        uint tid = thread_position_in_grid.y;
+        uint in_offset = thread_position_in_grid.x;
 
-        // Calculate packed dimensions
-        uint packed_rows   = (out_features + 3) / 4;
-        uint which_slice   = out_idx / packed_rows;
-        uint row_in_slice  = out_idx - which_slice * packed_rows;
-        uint row_offset    = row_in_slice * in_features;
-        uint batch_offset  = batch_idx * in_features;
-        uint shift_bits    = 2u * which_slice;
+        uint batch_idx = tid / (out_features / 4);
+        uint row_idx = tid % (out_features / 4);
 
-        float sum = 0.0f;
-        uint i = 0u;
-        // ------------ 8‑feature unrolled loop (2 × float4) ------------
-        for (; i + 7u < in_features; i += 8u) {
-            // Get input values
-            float4 x0 = float4(x[batch_offset + i + 0u], x[batch_offset + i + 1u],
-                              x[batch_offset + i + 2u], x[batch_offset + i + 3u]);
-            float4 x1 = float4(x[batch_offset + i + 4u], x[batch_offset + i + 5u],
-                              x[batch_offset + i + 6u], x[batch_offset + i + 7u]);
+        float sum[4] = {0.0};
 
-            // Get weights
-            uchar4 pv0 = *reinterpret_cast<const device uchar4*>(packed_weights + row_offset + i);
-            uchar4 pv1 = *reinterpret_cast<const device uchar4*>(packed_weights + row_offset + i + 4u);
+        for (uint i = in_offset * M; i < in_features; i += BLOCK * M) {
+            float v[M];
+            for (int j=0; j<M; j++) {
+                v[j] = x[batch_idx * in_features + i + j];
+            }
 
-            // Extract the 2-bit slice; {0,1,2} -> {-1,0,1} (11 is unused and would map to 2)
-            uint4  u0  = uint4(pv0) >> shift_bits;
-            uint4  u1  = uint4(pv1) >> shift_bits;
-            float4 w0 = float4(u0 & uint4(3u)) - 1.0f;
-            float4 w1 = float4(u1 & uint4(3u)) - 1.0f;
+            for (int j=0; j<M; j++) {
+                uint8_t w = packed_weights[row_idx * in_features + i + j];
+                sum[0] += v[j] * ((w & 3) - 1);
+                sum[1] += v[j] * (((w >> 2) & 3) - 1);
+                sum[2] += v[j] * (((w >> 4) & 3) - 1);
+                sum[3] += v[j] * (((w >> 6) & 3) - 1);
+            }
+        }
 
-            sum += dot(x0, w0) + dot(x1, w1);
+        for (int j=0; j<4; j++) {
+            sum[j] = simd_sum(sum[j]);
         }
 
 
         // Apply weight scaling by diving them or multiplying them
-        out[tid] = invert_weight_scales ? (sum / weight_scale[0])
-                                        : (sum * weight_scale[0]);
+        if (in_offset == 0) {
+            float scale = invert_weight_scales ? 1 / weight_scale[0] : weight_scale[0];
+            for (int i=0; i<4; i++) {
+                out[batch_idx * out_features + row_idx + i * (out_features/4)] = sum[i] * scale;
+            }
+        }
         """
         return mx.fast.metal_kernel(
             name="bitlinear_matmul_8unroll",
@@ -92,135 +96,80 @@ class BitLinear(nn.Module):
             source=source,
         )
 
-    def _compile_qkv_kernel(self):
-        """
-        Custom Metal kernel that performs fused QKV computation in parallel.
-        Handles Q, K, V outputs with their respective scales.
-        """
-        source = r"""
-        using namespace metal;
-        uint tid = thread_position_in_grid.x;
-        if (tid >= batch_size * total_out_features) return;
+    def execute_matmul_kernel(self, x, packed_weights):
+        # Handle multi-dimensional inputs by flattening all but the last dimension
+        original_shape = x.shape
+        if len(original_shape) > 2:
+            # Flatten to (total_batch_elements, in_features)
+            x_flattened = x.reshape(-1, original_shape[-1])
+            total_batch_elements = x_flattened.shape[0]
+            in_features = x_flattened.shape[1]
+        else:
+            x_flattened = x
+            total_batch_elements, in_features = x_flattened.shape
 
-        uint batch_idx = tid / total_out_features;
-        uint out_idx   = tid % total_out_features;
+        out_features = self.out_features
 
-        // Determine component once per output (Q, K, V)
-        uint component, local_out_idx, weight_slice_start, comp_out_feat;
-        if (out_idx < q_features) {
-            component = 0u; local_out_idx = out_idx; comp_out_feat = q_features; weight_slice_start = 0u;
-        } else if (out_idx < q_features + k_features) {
-            component = 1u; local_out_idx = out_idx - q_features; comp_out_feat = k_features; weight_slice_start = q_packed_rows;
-        } else {
-            component = 2u; local_out_idx = out_idx - q_features - k_features; comp_out_feat = v_features; weight_slice_start = q_packed_rows + k_packed_rows;
-        }
-
-        // Calculate packed dimensions
-        uint comp_packed_rows = (comp_out_feat + 3) / 4;
-        uint which_slice      = local_out_idx / comp_packed_rows;
-        uint row_in_slice     = local_out_idx - which_slice * comp_packed_rows;
-        uint row_offset       = (weight_slice_start + row_in_slice) * in_features;
-        uint batch_offset     = batch_idx * in_features;
-        uint shift_bits       = 2u * which_slice;
-
-        float sum = 0.0f;
-        uint i = 0u;
-        // ------------ 8‑feature unrolled loop (2 × float4) ------------
-        for (; i + 7u < in_features; i += 8u) {
-            // Get input values
-            float4 x0 = float4(x[batch_offset + i + 0u], x[batch_offset + i + 1u],
-                              x[batch_offset + i + 2u], x[batch_offset + i + 3u]);
-            float4 x1 = float4(x[batch_offset + i + 4u], x[batch_offset + i + 5u],
-                              x[batch_offset + i + 6u], x[batch_offset + i + 7u]);
-
-            // Get weights
-            uchar4 pv0 = *reinterpret_cast<const device uchar4*>(packed_weights + row_offset + i);
-            uchar4 pv1 = *reinterpret_cast<const device uchar4*>(packed_weights + row_offset + i + 4u);
-
-            // Extract the 2-bit slice; {0,1,2} -> {-1,0,1} (11 is unused and would map to 2)
-            uint4  u0  = uint4(pv0) >> shift_bits;
-            uint4  u1  = uint4(pv1) >> shift_bits;
-            float4 w0 = float4(u0 & uint4(3u)) - 1.0f;
-            float4 w1 = float4(u1 & uint4(3u)) - 1.0f;
-
-            sum += dot(x0, w0) + dot(x1, w1);
-        }
-
-        // Apply weight scaling by diving them or multiplying them
-        out[tid] = invert_weight_scales ? (sum / scales[component])
-                                        : (sum * scales[component]);
-        """
-        return mx.fast.metal_kernel(
-            name="bitlinear_fused_qkv_8unroll",
-            input_names=["x", "packed_weights", "scales", "invert_weight_scales"],
-            output_names=["out"],
-            source=source,
+        outputs = self._compiled_kernel(
+            inputs=[
+                x_flattened.astype(self.dtype),
+                packed_weights,
+                self.weight_scale,
+                self.invert_weight_scales,
+            ],
+            template=[
+                ("batch_size", total_batch_elements),
+                ("in_features", in_features),
+                ("out_features", out_features),
+            ],
+            grid=(32, total_batch_elements * out_features // 4, 1),
+            threadgroup=(32, 1, 1),  # SIMD width is 32 threads
+            output_shapes=[(total_batch_elements, out_features)],
+            output_dtypes=[self.dtype],
         )
 
+        # Reshape output back to match input shape but with out_features as last dimension
+        if len(original_shape) > 2:
+            output_shape = original_shape[:-1] + (out_features,)
+            return outputs[0].reshape(output_shape)
+        else:
+            return outputs[0]
 
-    def _flatten_input(self, x: mx.array):
-        if x.ndim <= 2:
-            return x, x.shape[0], x.shape[1]
-        flat = x.reshape(-1, x.shape[-1])
-        return flat, flat.shape[0], flat.shape[1]
+    def __call__(self, x):
+        """
+        Forward pass with weight scaling applied correctly.
+        """
+        org_dtype = x.dtype
 
-    def _dispatch_qkv(self, x: mx.array, packed_weights: mx.array, *,
-                      query_position: int, kv_position: int):
-        shape = x.shape
-        x_flat, batches, in_feat = self._flatten_input(x)
-        q = query_position; k = v = kv_position
-        total = q + k + v
-        q_pack = (q + 3) // 4; k_pack = (k + 3) // 4
+        # Use custom kernel for matrix multiplication directly on packed weights
+        y = self.execute_matmul_kernel(x, self.weight)
 
-        out = self._compiled_kernel(
-            inputs=[x_flat.astype(self.dtype), packed_weights, self.weight_scale, self.invert_weight_scales],
-            template=[
-                ("batch_size", batches), ("in_features", in_feat),
-                ("total_out_features", total), ("q_features", q),
-                ("k_features", k), ("v_features", v),
-                ("q_packed_rows", q_pack), ("k_packed_rows", k_pack),
-            ],
-            grid=(batches * total, 1, 1), threadgroup=(32, 1, 1),
-            output_shapes=[(batches, total)], output_dtypes=[self.dtype],
-        )[0]
-        return out.reshape(shape[:-1] + (total,)) if x.ndim > 2 else out
-
-    def _dispatch_matmul(self, x: mx.array, packed_weights: mx.array):
-        shape = x.shape
-        x_flat, batches, in_feat = self._flatten_input(x)
-        out = self._compiled_kernel(
-            inputs=[x_flat.astype(self.dtype), packed_weights, self.weight_scale, self.invert_weight_scales],
-            template=[("batch_size", batches), ("in_features", in_feat),
-                      ("out_features", self.out_features)],
-            grid=(batches * self.out_features, 1, 1), threadgroup=(32, 1, 1),
-            output_shapes=[(batches, self.out_features)], output_dtypes=[self.dtype],
-        )[0]
-        return out.reshape(shape[:-1] + (self.out_features,)) if x.ndim > 2 else out
-
-
-    def __call__(self, x: mx.array, **kwargs):
-        out = (self._dispatch_qkv(x, self.weight, **kwargs) if self.fused_qkv
-               else self._dispatch_matmul(x, self.weight))
+        # Add bias if present
         if self.bias is not None:
-            out = mx.add(out, self.bias)
-        return out.astype(x.dtype)
+            y = mx.add(y, self.bias)
+        return y.astype(org_dtype)
 
-    @staticmethod
-    def benchmark():
-        import time
-        cases = [
-            ("Tiny prompt", 1, 5, 4096), ("Small prompt", 1, 11, 4096),
-            ("Medium prompt", 1, 32, 4096), ("Large prompt", 1, 128, 4096),
-            ("Generation", 1, 200, 4096), ("Batch generation", 8, 100, 4096),
-        ]
-        for name, bs, sl, hs in cases:
-            model = BitLinear(hs, hs, fused_qkv=False)
-            x = mx.random.normal((bs, sl, hs))
-            for _ in range(5): model(x)
-            t0 = time.time()
-            for _ in range(100): mx.eval(model(x))
-            dt = (time.time() - t0) / 100
-            print(f"{name:<16}: {dt*1e3:.1f} ms | {(bs*sl)/dt:,.0f} tok/s")
 
-if __name__ == "__main__":
-    BitLinear.benchmark()
+class QuantAndBitLinear(nn.Linear):
+    """
+    A Linear layer that can be converted to a quantized and bitlinear version.
+    """
+
+    def to_quantized(
+        self, method: str = None, group_size: int = 64, bits: int = 4, **kwargs
+    ):
+
+        if method is None or group_size is None or bits is None:
+            return QuantizedLinear.from_linear(self, group_size, bits)
+
+        if method == "bitnet":
+            bitlinear = BitLinear(
+                in_features=self.weight.shape[1],
+                out_features=self.weight.shape[0],
+                bias=getattr(self, "bias", None) is not None,
+                invert_weight_scales=True,
+                **kwargs,
+            )
+            return bitlinear
+        else:
+            raise ValueError(f"Unknown quantization method: {method}")
