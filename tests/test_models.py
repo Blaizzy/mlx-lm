@@ -1296,6 +1296,37 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_kimi_linear(self):
+        from mlx_lm.models import kimi_linear
+
+        args = kimi_linear.ModelArgs(
+            model_type="kimi_linear",
+            vocab_size=1000,
+            hidden_size=128,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            intermediate_size=256,
+            head_dim=32,
+            rope_theta=1000,
+            rms_norm_eps=1e-5,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_rope_head_dim=8,
+            qk_nope_head_dim=24,
+            v_head_dim=32,
+            linear_attn_config={
+                "num_heads": 4,
+                "head_dim": 32,
+                "short_conv_kernel_size": 4,
+                "kda_layers": [2, 4],
+            },
+        )
+        model = kimi_linear.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
     def test_all_models(self):
         test_configs = [
             {

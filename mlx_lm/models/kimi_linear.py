@@ -109,14 +109,8 @@ class ModelArgs(BaseModelArgs):
 
 
 @partial(mx.compile, shapeless=True)
-def _swish(x: mx.array) -> mx.array:
-    return nn.silu(x)
-
-
-def _activation_fn(name: str):
-    if name == "silu" or name == "swish":
-        return _swish
-    raise ValueError(f"Unsupported activation function '{name}' for KimiLinear")
+def swiglu(gate, up):
+    return nn.silu(gate) * up
 
 
 class RMSNormGated(nn.Module):
@@ -152,10 +146,9 @@ class KimiMLP(nn.Module):
         self.gate_proj = nn.Linear(dim, hidden, bias=False)
         self.up_proj = nn.Linear(dim, hidden, bias=False)
         self.down_proj = nn.Linear(hidden, dim, bias=False)
-        self.act = _activation_fn(args.hidden_act)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(self.act(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 @mx.compile
@@ -271,6 +264,8 @@ class KimiMLAAttention(nn.Module):
         )
         self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, hidden, bias=False)
 
+        self._kv_split_point = args.kv_lora_rank or 0
+
         rope_dim = self.qk_rope_head_dim or self.q_head_dim
         self.rope = initialize_rope(
             rope_dim,
@@ -291,9 +286,7 @@ class KimiMLAAttention(nn.Module):
         q_pass, q_rot = mx.split(q_states, [self.qk_nope_head_dim], axis=-1)
 
         compressed = self.kv_a_proj(x)
-        k_pass, k_rot = mx.split(
-            compressed, [compressed.shape[-1] - self.qk_rope_head_dim], axis=-1
-        )
+        k_pass, k_rot = mx.split(compressed, [self._kv_split_point], axis=-1)
         k_pass = self.kv_a_norm(k_pass)
         kv = self.kv_b_proj(k_pass)
         kv = kv.reshape(
@@ -308,7 +301,7 @@ class KimiMLAAttention(nn.Module):
             k_rot = mx.reshape(k_rot, (B, L, 1, self.qk_rope_head_dim))
             k_rot = mx.broadcast_to(k_rot, (*k_pass.shape[:-1], self.qk_rope_head_dim))
         else:
-            k_rot = mx.zeros((*k_pass.shape[:-1], 0), dtype=k_pass.dtype)
+            k_rot = k_pass[:, :, :, :0]
 
         queries = mx.concatenate([q_pass, q_rot], axis=-1).transpose(0, 2, 1, 3)
         keys = mx.concatenate([k_pass, k_rot], axis=-1).transpose(0, 2, 1, 3)
@@ -360,6 +353,11 @@ class ShortConv1d(nn.Module):
         out = nn.silu(self.conv(conv_input))
         new_cache = conv_input[:, -self.kernel_size + 1 :, :]
         return out, new_cache
+
+
+def _l2norm(x, eps=1e-6):
+    norm = mx.linalg.norm(x, axis=-1, keepdims=True)
+    return x / (norm + eps)
 
 
 class KimiDeltaAttention(nn.Module):
@@ -448,10 +446,6 @@ class KimiDeltaAttention(nn.Module):
         k = k_conv.reshape(B, T, self.num_heads, self.head_dim).astype(mx.float32)
         v = v_conv.reshape(B, T, self.num_heads, self.head_dim).astype(mx.float32)
 
-        def _l2norm(x, eps=1e-6):
-            norm = mx.linalg.norm(x, axis=-1, keepdims=True)
-            return x / (norm + eps)
-
         q = _l2norm(q)
         k = _l2norm(k)
         q = q * self.scale
@@ -472,7 +466,7 @@ class KimiDeltaAttention(nn.Module):
             mask_bool = mask.astype(mx.bool_) if mask.dtype != mx.bool_ else mask
             if mask_bool.ndim == 2:
                 mask_bool = mx.expand_dims(mask_bool, axis=-1)
-            if mask_bool is not None and mask_bool.shape[-1] == 1:
+            if mask_bool.shape[-1] == 1:
                 mask_bool = mx.broadcast_to(mask_bool, (B, T, self.num_heads))
 
         out, new_state = gated_delta_update(
