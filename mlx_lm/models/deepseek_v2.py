@@ -42,6 +42,14 @@ class ModelArgs(BaseModelArgs):
     rope_scaling: Dict = None
     attention_bias: bool = False
 
+@dataclass
+class ModelArgs(BaseModelArgs):
+    text_config: Union[TextArgs, dict]
+    model_type: str
+
+    def __post_init__(self):
+        self.text_config = TextArgs.from_dict(self.text_config)
+
 
 def yarn_find_correction_dim(
     num_rotations, dim, base=10000, max_position_embeddings=2048
