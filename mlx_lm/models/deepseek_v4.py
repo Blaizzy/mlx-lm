@@ -295,27 +295,89 @@ def _make_hc_split_sinkhorn_kernel():
 
     source = """
         uint idx = thread_position_in_grid.x;
+        if (idx >= (uint)n_rows[0]) return;
         constexpr int MIX = (2 + HC) * HC;
         float epsv = static_cast<float>(eps[0]);
 
-        auto mix = mixes + idx * MIX;
-        auto pre_out = pre + idx * HC;
-        auto post_out = post + idx * HC;
-        auto comb_out = comb + idx * HC * HC;
+        const auto mix = mixes + idx * MIX;
+        auto pre_out   = pre   + idx * HC;
+        auto post_out  = post  + idx * HC;
+        auto comb_out  = comb  + idx * HC * HC;
 
-        float pre_scale = static_cast<float>(scale[0]);
-        float post_scale = static_cast<float>(scale[1]);
-        float comb_scale = static_cast<float>(scale[2]);
+        const float pre_scale  = static_cast<float>(scale[0]);
+        const float post_scale = static_cast<float>(scale[1]);
+        const float comb_scale = static_cast<float>(scale[2]);
 
+#if HC == 4
+        // Pre-sigmoid: float4 vectorized
+        {
+            float4 z = float4(
+                static_cast<float>(mix[0]), static_cast<float>(mix[1]),
+                static_cast<float>(mix[2]), static_cast<float>(mix[3])
+            ) * pre_scale + float4(
+                static_cast<float>(base[0]), static_cast<float>(base[1]),
+                static_cast<float>(base[2]), static_cast<float>(base[3])
+            );
+            *(device float4*)pre_out = 1.0f / (1.0f + metal::fast::exp(-z)) + epsv;
+        }
+
+        // Post-sigmoid: float4 vectorized
+        {
+            float4 z = float4(
+                static_cast<float>(mix[4]), static_cast<float>(mix[5]),
+                static_cast<float>(mix[6]), static_cast<float>(mix[7])
+            ) * post_scale + float4(
+                static_cast<float>(base[4]), static_cast<float>(base[5]),
+                static_cast<float>(base[6]), static_cast<float>(base[7])
+            );
+            *(device float4*)post_out = 2.0f / (1.0f + metal::fast::exp(-z));
+        }
+
+        // Comb: 4x4 matrix as float4 rows; tree-reduce max, vectorized exp + dot-product sum
+        constexpr int BASE = 2 * HC;
+        float4 rows[4];
+        for (int i = 0; i < 4; ++i) {
+            float4 v = float4(
+                fma(static_cast<float>(mix[BASE + i*HC + 0]), comb_scale, static_cast<float>(base[BASE + i*HC + 0])),
+                fma(static_cast<float>(mix[BASE + i*HC + 1]), comb_scale, static_cast<float>(base[BASE + i*HC + 1])),
+                fma(static_cast<float>(mix[BASE + i*HC + 2]), comb_scale, static_cast<float>(base[BASE + i*HC + 2])),
+                fma(static_cast<float>(mix[BASE + i*HC + 3]), comb_scale, static_cast<float>(base[BASE + i*HC + 3]))
+            );
+            float m = metal::max(metal::max(v.x, v.y), metal::max(v.z, v.w));
+            float4 e = metal::fast::exp(v - m);
+            rows[i] = e * metal::fast::recip(dot(e, float4(1.0f)) + epsv) + epsv;
+        }
+
+        // Initial column normalization
+        {
+            float4 inv_c = metal::fast::recip(rows[0] + rows[1] + rows[2] + rows[3] + epsv);
+            rows[0] *= inv_c; rows[1] *= inv_c;
+            rows[2] *= inv_c; rows[3] *= inv_c;
+        }
+
+        // Sinkhorn iterations: row-normalize then column-normalize
+        for (int iter = 1; iter < ITERS; ++iter) {
+            for (int i = 0; i < 4; ++i)
+                rows[i] *= metal::fast::recip(dot(rows[i], float4(1.0f)) + epsv);
+            float4 inv_c = metal::fast::recip(rows[0] + rows[1] + rows[2] + rows[3] + epsv);
+            rows[0] *= inv_c; rows[1] *= inv_c;
+            rows[2] *= inv_c; rows[3] *= inv_c;
+        }
+
+        // Write comb output
+        *(device float4*)(comb_out)      = rows[0];
+        *(device float4*)(comb_out + 4)  = rows[1];
+        *(device float4*)(comb_out + 8)  = rows[2];
+        *(device float4*)(comb_out + 12) = rows[3];
+
+#else
+        // Scalar fallback for HC != 4
         for (int i = 0; i < HC; ++i) {
-            float z = static_cast<float>(mix[i]) * pre_scale
-                + static_cast<float>(base[i]);
+            float z = fma(static_cast<float>(mix[i]), pre_scale, static_cast<float>(base[i]));
             pre_out[i] = 1.0f / (1.0f + metal::fast::exp(-z)) + epsv;
         }
         for (int i = 0; i < HC; ++i) {
-            int off = HC + i;
-            float z = static_cast<float>(mix[off]) * post_scale
-                + static_cast<float>(base[off]);
+            float z = fma(static_cast<float>(mix[HC + i]), post_scale, static_cast<float>(base[HC + i]));
             post_out[i] = 2.0f / (1.0f + metal::fast::exp(-z));
         }
 
@@ -323,69 +385,51 @@ def _make_hc_split_sinkhorn_kernel():
         for (int i = 0; i < HC; ++i) {
             float row_max = -INFINITY;
             for (int j = 0; j < HC; ++j) {
-                int cidx = i * HC + j;
-                int off = 2 * HC + cidx;
-                float v = static_cast<float>(mix[off]) * comb_scale
-                    + static_cast<float>(base[off]);
-                c[cidx] = v;
+                int off = 2 * HC + i * HC + j;
+                float v = fma(static_cast<float>(mix[off]), comb_scale, static_cast<float>(base[off]));
+                c[i * HC + j] = v;
                 row_max = metal::max(row_max, v);
             }
             float row_sum = 0.0f;
             for (int j = 0; j < HC; ++j) {
-                int cidx = i * HC + j;
-                float v = metal::fast::exp(c[cidx] - row_max);
-                c[cidx] = v;
+                float v = metal::fast::exp(c[i * HC + j] - row_max);
+                c[i * HC + j] = v;
                 row_sum += v;
             }
-            float inv_sum = 1.0f / row_sum;
-            for (int j = 0; j < HC; ++j) {
-                int cidx = i * HC + j;
-                c[cidx] = c[cidx] * inv_sum + epsv;
-            }
+            float inv_sum = metal::fast::recip(row_sum + epsv);
+            for (int j = 0; j < HC; ++j)
+                c[i * HC + j] = c[i * HC + j] * inv_sum + epsv;
         }
 
         for (int j = 0; j < HC; ++j) {
             float col_sum = 0.0f;
-            for (int i = 0; i < HC; ++i) {
-                col_sum += c[i * HC + j];
-            }
-            float inv_denom = 1.0f / (col_sum + epsv);
-            for (int i = 0; i < HC; ++i) {
-                c[i * HC + j] *= inv_denom;
-            }
+            for (int i = 0; i < HC; ++i) col_sum += c[i * HC + j];
+            float inv_denom = metal::fast::recip(col_sum + epsv);
+            for (int i = 0; i < HC; ++i) c[i * HC + j] *= inv_denom;
         }
 
         for (int iter = 1; iter < ITERS; ++iter) {
             for (int i = 0; i < HC; ++i) {
                 float row_sum = 0.0f;
-                for (int j = 0; j < HC; ++j) {
-                    row_sum += c[i * HC + j];
-                }
-                float inv_denom = 1.0f / (row_sum + epsv);
-                for (int j = 0; j < HC; ++j) {
-                    c[i * HC + j] *= inv_denom;
-                }
+                for (int j = 0; j < HC; ++j) row_sum += c[i * HC + j];
+                float inv_denom = metal::fast::recip(row_sum + epsv);
+                for (int j = 0; j < HC; ++j) c[i * HC + j] *= inv_denom;
             }
             for (int j = 0; j < HC; ++j) {
                 float col_sum = 0.0f;
-                for (int i = 0; i < HC; ++i) {
-                    col_sum += c[i * HC + j];
-                }
-                float inv_denom = 1.0f / (col_sum + epsv);
-                for (int i = 0; i < HC; ++i) {
-                    c[i * HC + j] *= inv_denom;
-                }
+                for (int i = 0; i < HC; ++i) col_sum += c[i * HC + j];
+                float inv_denom = metal::fast::recip(col_sum + epsv);
+                for (int i = 0; i < HC; ++i) c[i * HC + j] *= inv_denom;
             }
         }
 
-        for (int i = 0; i < HC * HC; ++i) {
-            comb_out[i] = c[i];
-        }
+        for (int i = 0; i < HC * HC; ++i) comb_out[i] = c[i];
+#endif
     """
 
     return mx.fast.metal_kernel(
         name="deepseek_v4_hc_split_sinkhorn",
-        input_names=["mixes", "scale", "base", "eps"],
+        input_names=["mixes", "scale", "base", "eps", "n_rows"],
         output_names=["pre", "post", "comb"],
         source=source,
     )
@@ -407,10 +451,12 @@ def hc_split_sinkhorn(
 
     if not isinstance(eps, mx.array):
         eps = mx.array([eps], dtype=mx.float32)
+    n_rows = mixes.size // ((2 + hc_mult) * hc_mult)
+    n_rows_arr = mx.array([n_rows], dtype=mx.int32)
     return _hc_split_sinkhorn_kernel(
-        inputs=[mixes, scale, base, eps],
+        inputs=[mixes, scale, base, eps, n_rows_arr],
         template=[("HC", hc_mult), ("ITERS", sinkhorn_iters)],
-        grid=(mixes.size // ((2 + hc_mult) * hc_mult), 1, 1),
+        grid=(n_rows, 1, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[
             (*mixes.shape[:-1], hc_mult),
