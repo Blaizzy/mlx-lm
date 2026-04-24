@@ -308,8 +308,7 @@ def _make_hc_split_sinkhorn_kernel():
         const float post_scale = static_cast<float>(scale[1]);
         const float comb_scale = static_cast<float>(scale[2]);
 
-#if HC == 4
-        // Pre-sigmoid: float4 vectorized
+        // Pre-sigmoid: float4 vectorized (HC == 4)
         {
             float4 z = float4(
                 static_cast<float>(mix[0]), static_cast<float>(mix[1]),
@@ -364,67 +363,11 @@ def _make_hc_split_sinkhorn_kernel():
             rows[2] *= inv_c; rows[3] *= inv_c;
         }
 
-        // Write comb output
+        // Write comb output (four aligned 128-bit stores)
         *(device float4*)(comb_out)      = rows[0];
         *(device float4*)(comb_out + 4)  = rows[1];
         *(device float4*)(comb_out + 8)  = rows[2];
         *(device float4*)(comb_out + 12) = rows[3];
-
-#else
-        // Scalar fallback for HC != 4
-        for (int i = 0; i < HC; ++i) {
-            float z = fma(static_cast<float>(mix[i]), pre_scale, static_cast<float>(base[i]));
-            pre_out[i] = 1.0f / (1.0f + metal::fast::exp(-z)) + epsv;
-        }
-        for (int i = 0; i < HC; ++i) {
-            float z = fma(static_cast<float>(mix[HC + i]), post_scale, static_cast<float>(base[HC + i]));
-            post_out[i] = 2.0f / (1.0f + metal::fast::exp(-z));
-        }
-
-        float c[HC * HC];
-        for (int i = 0; i < HC; ++i) {
-            float row_max = -INFINITY;
-            for (int j = 0; j < HC; ++j) {
-                int off = 2 * HC + i * HC + j;
-                float v = fma(static_cast<float>(mix[off]), comb_scale, static_cast<float>(base[off]));
-                c[i * HC + j] = v;
-                row_max = metal::max(row_max, v);
-            }
-            float row_sum = 0.0f;
-            for (int j = 0; j < HC; ++j) {
-                float v = metal::fast::exp(c[i * HC + j] - row_max);
-                c[i * HC + j] = v;
-                row_sum += v;
-            }
-            float inv_sum = metal::fast::recip(row_sum + epsv);
-            for (int j = 0; j < HC; ++j)
-                c[i * HC + j] = c[i * HC + j] * inv_sum + epsv;
-        }
-
-        for (int j = 0; j < HC; ++j) {
-            float col_sum = 0.0f;
-            for (int i = 0; i < HC; ++i) col_sum += c[i * HC + j];
-            float inv_denom = metal::fast::recip(col_sum + epsv);
-            for (int i = 0; i < HC; ++i) c[i * HC + j] *= inv_denom;
-        }
-
-        for (int iter = 1; iter < ITERS; ++iter) {
-            for (int i = 0; i < HC; ++i) {
-                float row_sum = 0.0f;
-                for (int j = 0; j < HC; ++j) row_sum += c[i * HC + j];
-                float inv_denom = metal::fast::recip(row_sum + epsv);
-                for (int j = 0; j < HC; ++j) c[i * HC + j] *= inv_denom;
-            }
-            for (int j = 0; j < HC; ++j) {
-                float col_sum = 0.0f;
-                for (int i = 0; i < HC; ++i) col_sum += c[i * HC + j];
-                float inv_denom = metal::fast::recip(col_sum + epsv);
-                for (int i = 0; i < HC; ++i) c[i * HC + j] *= inv_denom;
-            }
-        }
-
-        for (int i = 0; i < HC * HC; ++i) comb_out[i] = c[i];
-#endif
     """
 
     return mx.fast.metal_kernel(
