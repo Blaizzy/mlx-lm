@@ -74,6 +74,8 @@ class ModelArgs(BaseModelArgs):
         bad = [r for r in self.compress_ratios if r not in (0, 4, 128)]
         if bad:
             raise ValueError(f"Unsupported DeepSeek-V4 compress ratios: {bad}")
+        if self.quantization is None:
+            self.quantization = _default_quantization()
 
 
 def _score_func(scores: mx.array, func: str) -> mx.array:
@@ -1839,14 +1841,22 @@ class Model(nn.Module):
             ):
                 for suffix in ("weight", "scales", "biases"):
                     key0 = f"{prefix}.0.{src}.{suffix}"
+                    pre_stacked_key = f"{prefix}.{src}.{suffix}"
+                    dst_key = (
+                        f"model.layers.{layer_idx}.ffn.switch_mlp.{dst}.{suffix}"
+                    )
                     if key0 in weights:
                         stacked = [
                             weights.pop(f"{prefix}.{e}.{src}.{suffix}")
                             for e in range(self.args.n_routed_experts)
                         ]
-                        weights[
-                            f"model.layers.{layer_idx}.ffn.switch_mlp.{dst}.{suffix}"
-                        ] = mx.stack(stacked)
+                        if suffix != "biases":
+                            weights[dst_key] = mx.stack(stacked)
+                    elif pre_stacked_key in weights:
+                        if suffix != "biases":
+                            weights[dst_key] = weights.pop(pre_stacked_key)
+                        else:
+                            weights.pop(pre_stacked_key)
 
         # Stack grouped wo_a.0..N into single wo_a (concat along output dim)
         o_groups = self.args.o_groups
