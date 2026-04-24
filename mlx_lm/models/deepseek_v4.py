@@ -346,12 +346,12 @@ def _make_hc_split_sinkhorn_kernel():
             );
             float m = metal::max(metal::max(v.x, v.y), metal::max(v.z, v.w));
             float4 e = metal::fast::exp(v - m);
-            rows[i] = e * metal::fast::recip(dot(e, float4(1.0f))) + epsv;
+            rows[i] = e * 1.0f /(dot(e, float4(1.0f))) + epsv;
         }
 
         // Initial column normalization
         {
-            float4 inv_c = metal::fast::recip(rows[0] + rows[1] + rows[2] + rows[3] + epsv);
+            float4 inv_c = 1.0f /(rows[0] + rows[1] + rows[2] + rows[3] + epsv);
             rows[0] *= inv_c; rows[1] *= inv_c;
             rows[2] *= inv_c; rows[3] *= inv_c;
         }
@@ -359,8 +359,8 @@ def _make_hc_split_sinkhorn_kernel():
         // Sinkhorn iterations: row-normalize then column-normalize
         for (int iter = 1; iter < ITERS; ++iter) {
             for (int i = 0; i < 4; ++i)
-                rows[i] *= metal::fast::recip(dot(rows[i], float4(1.0f)) + epsv);
-            float4 inv_c = metal::fast::recip(rows[0] + rows[1] + rows[2] + rows[3] + epsv);
+                rows[i] *= 1.0f /(dot(rows[i], float4(1.0f)) + epsv);
+            float4 inv_c = 1.0f /(rows[0] + rows[1] + rows[2] + rows[3] + epsv);
             rows[0] *= inv_c; rows[1] *= inv_c;
             rows[2] *= inv_c; rows[3] *= inv_c;
         }
