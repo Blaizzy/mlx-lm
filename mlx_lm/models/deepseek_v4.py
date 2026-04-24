@@ -456,7 +456,7 @@ def hc_split_sinkhorn(
     return _hc_split_sinkhorn_kernel(
         inputs=[mixes, scale, base, eps, n_rows_arr],
         template=[("HC", hc_mult), ("ITERS", sinkhorn_iters)],
-        grid=(n_rows, 1, 1),
+        grid=((n_rows + 255) & ~255, 1, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[
             (*mixes.shape[:-1], hc_mult),
