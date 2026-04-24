@@ -611,9 +611,18 @@ def load(
     tokenizer_config_file = model_path / "tokenizer_config.json"
     chat_template = None
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path, **(tokenizer_config_extra or {})
-    )
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path, **(tokenizer_config_extra or {})
+        )
+    except AttributeError:
+        # Custom model types (e.g. deepseek_v4) may have config fields like
+        # rope_scaling that trigger transformers' config standardization which
+        # expects attributes (max_position_embeddings) absent from the generic
+        # PreTrainedConfig.  Fall back to loading the tokenizer directly.
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(
+            model_path, **(tokenizer_config_extra or {})
+        )
 
     tokenizer_config = tokenizer.init_kwargs
 
