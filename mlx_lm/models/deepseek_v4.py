@@ -684,7 +684,7 @@ def _make_fused_sparse_attn_kernel():
 
 _fused_sparse_attn_kernel = _make_fused_sparse_attn_kernel()
 
-
+@mx.compile
 def fused_sparse_attention(
     q: mx.array,
     local_kv: mx.array,
@@ -1392,11 +1392,7 @@ class DeepseekV4Cache:
 
 
 class Compressor(nn.Module):
-    # NOTE: Hadamard rotation omitted — assumes unrotated checkpoint.
-    # The HF reference applies a fast Walsh-Hadamard transform to KV activations
-    # before FP4/FP8 quantization to smooth outlier distributions. This doesn't
-    # affect correctness for weights-only quantization, but loading a checkpoint
-    # trained with Hadamard-rotated KV states would silently diverge.
+
     def __init__(self, config: ModelArgs, compress_ratio: int, head_dim: int):
         super().__init__()
         self.compress_ratio = compress_ratio
@@ -1410,11 +1406,6 @@ class Compressor(nn.Module):
         self.norm = nn.RMSNorm(head_dim, eps=config.rms_norm_eps)
 
     def _overlap_transform(self, x: mx.array, fill_value: float):
-        # Build the (B, W, 2R, head_dim) output analytically:
-        #   rows [0 : R]  = first-half channels of the PREVIOUS window
-        #                   (fill_value for window 0, since there is no prior window)
-        #   rows [R : 2R] = second-half channels of the CURRENT window
-        # Two concatenates replace the original mx.full + two scatter writes.
         B, W, R, _ = x.shape
         second_half = x[:, :, :, self.head_dim :]                         # (B, W, R, head_dim)
         fill_row    = mx.full((B, 1, R, self.head_dim), fill_value, dtype=x.dtype)
@@ -1533,7 +1524,7 @@ class Indexer(nn.Module):
         k = min(self.index_topk, pooled.shape[1])
         return mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
 
-
+@mx.compile
 def _split_sparse_attention(
     q: mx.array,
     local_kv: mx.array,
@@ -1732,9 +1723,7 @@ class V4Attention(nn.Module):
             pooled = self.compressor(x, self.compress_rope, v4_cache, offset)
             if pooled.shape[1] > 0:
                 if hasattr(self, "indexer") and L > 1:
-                    # Prefill only: run the indexer to get sparse top-k indices.
-                    # For decode (L==1), C <= index_topk always so the indexer
-                    # would select all tokens anyway — skip it and use pooled[:, None].
+
                     topk = self.indexer(
                         x, q_residual, self.compress_rope, self.rope, v4_cache, offset
                     )
@@ -1813,10 +1802,6 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         self.hc_head = HyperHead(config)
 
     def __call__(self, inputs: mx.array, cache: Optional[Any] = None) -> mx.array:
-        # generate_step adds [None] to the prompt, which can produce (1, 1, L)
-        # when the caller already passes (1, L). Flatten to (B, L).
-        if inputs.ndim != 2:
-            inputs = inputs.reshape(-1, inputs.shape[-1])
         h = self.embed_tokens(inputs)
         h = mx.broadcast_to(
             h[:, :, None, :],
@@ -1881,10 +1866,6 @@ class Model(nn.Module):
     @property
     def cast_predicate(self):
         def predicate(k):
-            # attn_sink and correction bias must stay float32 (small, precision-sensitive).
-            # HC base/scale are tiny f32 bias/gain arrays used inside sinkhorn — keep f32.
-            # HC fn weights are large (mix × hidden) projection matrices: cast to bfloat16
-            # to halve their memory footprint; compute_weights re-casts if needed.
             return not (
                 "attn_sink" in k
                 or "e_score_correction_bias" in k
@@ -2006,12 +1987,8 @@ class Model(nn.Module):
 
         top_remap = {
             "embed.weight": "model.embed_tokens.weight",
-            "embed.scales": "model.embed_tokens.scales",
-            "embed.biases": "model.embed_tokens.biases",
             "norm.weight": "model.norm.weight",
             "head.weight": "lm_head.weight",
-            "head.scales": "lm_head.scales",
-            "head.biases": "lm_head.biases",
             "hc_head_fn": "model.hc_head.fn",
             "hc_head_base": "model.hc_head.base",
             "hc_head_scale": "model.hc_head.scale",
@@ -2040,33 +2017,15 @@ class Model(nn.Module):
                 ("w2", "down_proj"),
                 ("w3", "up_proj"),
             ):
-                for suffix in ("weight", "scales", "biases"):
-                    key0 = f"{prefix}.0.{src}.{suffix}"
-                    pre_stacked_key = f"{prefix}.{src}.{suffix}"
-                    dst_key = (
-                        f"model.layers.{layer_idx}.ffn.switch_mlp.{dst}.{suffix}"
-                    )
-                    if key0 in weights:
-                        stacked = [
-                            weights.pop(f"{prefix}.{e}.{src}.{suffix}")
-                            for e in range(self.args.n_routed_experts)
-                        ]
-                        weights[dst_key] = mx.stack(stacked)
-                    elif pre_stacked_key in weights:
-                        weights[dst_key] = weights.pop(pre_stacked_key)
-
-        # Stack grouped wo_a.0..N into single wo_a (concat along output dim)
-        o_groups = self.args.o_groups
-        for layer_idx in range(n_layers):
-            prefix = f"model.layers.{layer_idx}.attn.wo_a"
-            for suffix in ("weight", "scales", "biases"):
-                key0 = f"{prefix}.0.{suffix}"
+                key0 = f"{prefix}.0.{src}.weight"
                 if key0 in weights:
-                    parts = [
-                        weights.pop(f"{prefix}.{g}.{suffix}")
-                        for g in range(o_groups)
+                    stacked = [
+                        weights.pop(f"{prefix}.{e}.{src}.weight")
+                        for e in range(self.args.n_routed_experts)
                     ]
-                    weights[f"{prefix}.{suffix}"] = mx.concatenate(parts, axis=0)
+                    weights[f"model.layers.{layer_idx}.ffn.switch_mlp.{dst}.weight"] = (
+                        mx.stack(stacked)
+                    )
 
         return weights
 
