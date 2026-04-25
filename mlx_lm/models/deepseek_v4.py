@@ -499,7 +499,7 @@ def _make_fused_sparse_attn_kernel():
         // --- Sparse (compressed) KV via index gather ---
         {
             const device auto* ckv = compressed_kv + (uint64_t)b * C_v * D;
-            const device auto* ip = topk_idxs + ((uint64_t)b * L_v + l) * K_v;
+            const constant auto* ip = topk_idxs + ((uint64_t)b * L_v + l) * K_v;
             for (int k = 0; k < K_v; k++) {
                 int idx = int(ip[k]);
                 if (idx < 0) continue;
@@ -542,7 +542,7 @@ def _make_fused_sparse_attn_kernel():
             float inv_l = 1.f / max(l_sum, 1e-6f);
             device auto* op = out + ((uint64_t)b*H*L_v + head*L_v + l) * D;
             for (int i = 0; i < DPT; i++)
-                op[d_off + i] = decltype(*op)(acc[i] * inv_l);
+                op[d_off + i] = static_cast<remove_reference_t<decltype(*op)>>(acc[i] * inv_l);
         }
     """
 
