@@ -295,6 +295,51 @@ def _make_partial_rope_kernel():
 _partial_rope_kernel = _make_partial_rope_kernel()
 
 
+def _make_q_norm_kernel():
+    """Per-head RMS norm for query vectors: fuses sq-accumulate + rsqrt + scale in one pass."""
+    if mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return None
+
+    source = """
+        uint tid = thread_position_in_threadgroup.x;  // 0..31 (one SIMD group)
+        uint gid = threadgroup_position_in_grid.x;    // one per (b, l, h) triplet
+
+        int D   = dims[0];
+        int L_v = dims[1];
+        int H_v = dims[2];
+        float eps_v = float(eps[0]);
+
+        uint h   = gid % (uint)H_v;
+        uint tmp = gid / (uint)H_v;
+        uint l   = tmp % (uint)L_v;
+        uint b   = tmp / (uint)L_v;
+
+        const auto xp = x + ((uint64_t)b * L_v * H_v + l * H_v + h) * D;
+        auto       yp = y + ((uint64_t)b * L_v * H_v + l * H_v + h) * D;
+
+        // Pass 1: accumulate partial sum of squares (stride-32 coalesced)
+        float partial_sq = 0.f;
+        for (int i = (int)tid; i < D; i += 32)
+            partial_sq = fma(float(xp[i]), float(xp[i]), partial_sq);
+
+        float rms_scale = metal::fast::rsqrt(simd_sum(partial_sq) / float(D) + eps_v);
+
+        // Pass 2: apply scale (D=512 fits in L1 cache; second pass is cache-warm)
+        for (int i = (int)tid; i < D; i += 32)
+            store_elem(yp[i], float(xp[i]) * rms_scale);
+    """
+    return mx.fast.metal_kernel(
+        name="ds4_q_norm",
+        input_names=["x", "eps", "dims"],
+        output_names=["y"],
+        header="template<typename T> inline void store_elem(device T& dst, float v) { dst = T(v); }",
+        source=source,
+    )
+
+
+_q_norm_kernel = _make_q_norm_kernel()
+
+
 def _apply_partial_rope(
     x: mx.array,
     rope: DeepseekV4RoPE,
@@ -719,15 +764,17 @@ class HyperConnection(nn.Module):
         self._hc_eps = (mx.array([config.hc_eps], dtype=mx.float32),)
         self.norm_eps = config.rms_norm_eps
         mix = (2 + self.hc_mult) * self.hc_mult
-        self.fn = mx.zeros((mix, self.hc_mult * config.hidden_size), dtype=mx.float32)
+        self.fn = mx.zeros((mix, self.hc_mult * config.hidden_size), dtype=mx.bfloat16)
         self.base = mx.zeros((mix,), dtype=mx.float32)
         self.scale = mx.ones((3,), dtype=mx.float32)
 
     def compute_weights(self, x: mx.array):
         B, L, H, D = x.shape
-        flat = x.reshape(B, L, H * D).astype(mx.float32)
-        rsqrt = _rms_rsqrt(flat, self.norm_eps)
-        mixes = (flat @ self.fn.T) * rsqrt
+        flat = x.reshape(B, L, H * D)
+        flat_f32 = flat.astype(mx.float32)
+        rsqrt = _rms_rsqrt(flat_f32, self.norm_eps)
+        # fn is bfloat16; match flat's dtype so MLX uses a native bf16 GEMV.
+        mixes = (flat.astype(self.fn.dtype) @ self.fn.T).astype(mx.float32) * rsqrt
         split_sinkhorn = _hc_split_sinkhorn_ops if self.training else hc_split_sinkhorn
         return split_sinkhorn(
             mixes,
@@ -759,16 +806,17 @@ class HyperHead(nn.Module):
         self.norm_eps = config.rms_norm_eps
         self.hc_eps = config.hc_eps
         self.fn = mx.zeros(
-            (self.hc_mult, self.hc_mult * config.hidden_size), dtype=mx.float32
+            (self.hc_mult, self.hc_mult * config.hidden_size), dtype=mx.bfloat16
         )
         self.base = mx.zeros((self.hc_mult,), dtype=mx.float32)
         self.scale = mx.ones((1,), dtype=mx.float32)
 
     def __call__(self, x: mx.array):
         B, L, H, D = x.shape
-        flat = x.reshape(B, L, H * D).astype(mx.float32)
-        rsqrt = _rms_rsqrt(flat, self.norm_eps)
-        mixes = (flat @ self.fn.T) * rsqrt
+        flat = x.reshape(B, L, H * D)
+        flat_f32 = flat.astype(mx.float32)
+        rsqrt = _rms_rsqrt(flat_f32, self.norm_eps)
+        mixes = (flat.astype(self.fn.dtype) @ self.fn.T).astype(mx.float32) * rsqrt
         pre = mx.sigmoid(mixes * self.scale[0] + self.base) + self.hc_eps
         return (pre[..., None] * x.astype(mx.float32)).sum(axis=2).astype(x.dtype)
 
@@ -1480,11 +1528,18 @@ class Compressor(nn.Module):
         self.norm = nn.RMSNorm(head_dim, eps=config.rms_norm_eps)
 
     def _overlap_transform(self, x: mx.array, fill_value: float):
+        # Build the (B, W, 2R, head_dim) output analytically:
+        #   rows [0 : R]  = first-half channels of the PREVIOUS window
+        #                   (fill_value for window 0, since there is no prior window)
+        #   rows [R : 2R] = second-half channels of the CURRENT window
+        # Two concatenates replace the original mx.full + two scatter writes.
         B, W, R, _ = x.shape
-        out = mx.full((B, W, 2 * R, self.head_dim), fill_value, dtype=x.dtype)
-        out[:, :, R:] = x[:, :, :, self.head_dim :]
-        out[:, 1:, :R] = x[:, :-1, :, : self.head_dim]
-        return out
+        second_half = x[:, :, :, self.head_dim :]                         # (B, W, R, head_dim)
+        fill_row    = mx.full((B, 1, R, self.head_dim), fill_value, dtype=x.dtype)
+        prev_first  = mx.concatenate(
+            [fill_row, x[:, :-1, :, : self.head_dim]], axis=1
+        )                                                                   # (B, W, R, head_dim)
+        return mx.concatenate([prev_first, second_half], axis=2)           # (B, W, 2R, head_dim)
 
     def __call__(
         self,
@@ -1935,12 +1990,23 @@ class Model(nn.Module):
     @property
     def cast_predicate(self):
         def predicate(k):
+            # attn_sink and correction bias must stay float32 (small, precision-sensitive).
+            # HC base/scale are tiny f32 bias/gain arrays used inside sinkhorn — keep f32.
+            # HC fn weights are large (mix × hidden) projection matrices: cast to bfloat16
+            # to halve their memory footprint; compute_weights re-casts if needed.
             return not (
                 "attn_sink" in k
                 or "e_score_correction_bias" in k
-                or ".attn_hc." in k
-                or ".ffn_hc." in k
-                or ".hc_head." in k
+                or k.endswith(
+                    (
+                        ".attn_hc.base",
+                        ".attn_hc.scale",
+                        ".ffn_hc.base",
+                        ".ffn_hc.scale",
+                        ".hc_head.base",
+                        ".hc_head.scale",
+                    )
+                )
             )
 
         return predicate
