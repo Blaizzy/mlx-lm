@@ -340,118 +340,6 @@ def _make_q_norm_kernel():
 _q_norm_kernel = _make_q_norm_kernel()
 
 
-def _make_hc_collapse_kernel():
-    """Fuse pre-weighted HC sum into a single Metal pass.
-
-    Replaces: (pre[..., None] * x.astype(f32)).sum(axis=2).astype(x.dtype)
-    Input x:  (B, L, HC, D)  — original dtype (bf16)
-    Input pre:(B, L, HC)     — float32 weights from sinkhorn
-    Output:   (B, L, D)      — same dtype as x
-
-    32 threads per (b, l) pair, each sweeping D in strides of 32.
-    HC inner loop is unrolled (template param).
-    """
-    if mx.default_device() != mx.gpu or not mx.metal.is_available():
-        return None
-
-    source = """
-        uint tid = thread_position_in_threadgroup.x;  // 0..31
-        uint gid = threadgroup_position_in_grid.x;    // one per (b, l) pair
-
-        int D_v = dims[0];
-
-        // flat layout: x[bl, h, d] = x_base + gid*HC*D + h*D + d
-        const auto xp = x   + (uint64_t)gid * HC * D_v;
-        const auto pp = pre + (uint64_t)gid * HC;
-        auto       op = out + (uint64_t)gid * D_v;
-
-        // Load HC pre-weights into registers (HC=4 scalars = 16 B)
-        float pw[HC];
-        for (int h = 0; h < HC; h++) pw[h] = pp[h];
-
-        // Fused weighted sum: out[d] = sum_h(pre[h] * x[h, d])
-        for (int d = (int)tid; d < D_v; d += 32) {
-            float sum = 0.f;
-            for (int h = 0; h < HC; h++)
-                sum = fma(float(xp[(uint64_t)h * D_v + d]), pw[h], sum);
-            store_elem(op[d], sum);
-        }
-    """
-    return mx.fast.metal_kernel(
-        name="ds4_hc_collapse",
-        input_names=["x", "pre", "dims"],
-        output_names=["out"],
-        header="template<typename T> inline void store_elem(device T& dst, float v) { dst = T(v); }",
-        source=source,
-    )
-
-
-_hc_collapse_kernel = _make_hc_collapse_kernel()
-
-
-def _make_hc_expand_kernel():
-    """Fuse HC expand into a single Metal pass.
-
-    Replaces:
-        y = post[..., None] * block_out[:, :, None, :].astype(f32)
-        y = y + matmul(comb.astype(f32), residual.astype(f32))
-        return y.astype(dtype)
-
-    The matmul forces a 128 KB f32 intermediate to DRAM; this kernel avoids it.
-
-    Inputs:
-        block_out: (B, L, D)       — bf16 attention/FFN output
-        residual:  (B, L, HC, D)   — bf16 HC tensor before the block
-        post:      (B, L, HC)      — float32 post-scale from sinkhorn
-        comb:      (B, L, HC, HC)  — float32 combination matrix from sinkhorn
-    Output:
-        out: (B, L, HC, D)         — same dtype as residual
-
-    32 threads per (b, l, h) triple, sweeping D in strides of 32.
-    HC inner loop unrolled (template param).
-    """
-    if mx.default_device() != mx.gpu or not mx.metal.is_available():
-        return None
-
-    source = """
-        uint tid = thread_position_in_threadgroup.x;  // 0..31
-        uint gid = threadgroup_position_in_grid.x;    // one per (b, l, h)
-
-        int D_v = dims[0];
-        uint h  = gid % HC;
-        uint bl = gid / HC;   // linear B*L index
-
-        const auto bp = block_out + (uint64_t)bl * D_v;            // (D,)
-        const auto rp = residual  + (uint64_t)bl * HC * D_v;       // (HC, D)
-        const auto pp = post      + (uint64_t)bl * HC;              // (HC,)
-        const auto cp = comb      + (uint64_t)bl * HC * HC;         // (HC, HC)
-        auto       op = out       + ((uint64_t)bl * HC + h) * D_v;  // (D,)
-
-        // Load scalars for this h: post_h and comb[h, *]
-        float post_h = pp[h];
-        float cv[HC];
-        for (int k = 0; k < HC; k++) cv[k] = cp[h * HC + k];
-
-        // Fused: out[d] = post_h * block_out[d] + sum_k(comb[h,k] * residual[k, d])
-        for (int d = (int)tid; d < D_v; d += 32) {
-            float val = post_h * float(bp[d]);
-            for (int k = 0; k < HC; k++)
-                val = fma(cv[k], float(rp[(uint64_t)k * D_v + d]), val);
-            store_elem(op[d], val);
-        }
-    """
-    return mx.fast.metal_kernel(
-        name="ds4_hc_expand",
-        input_names=["block_out", "residual", "post", "comb", "dims"],
-        output_names=["out"],
-        header="template<typename T> inline void store_elem(device T& dst, float v) { dst = T(v); }",
-        source=source,
-    )
-
-
-_hc_expand_kernel = _make_hc_expand_kernel()
-
-
 def _apply_partial_rope(
     x: mx.array,
     rope: DeepseekV4RoPE,
@@ -899,21 +787,7 @@ class HyperConnection(nn.Module):
 
     def collapse(self, x: mx.array):
         pre, post, comb = self.compute_weights(x)
-        B, L = x.shape[0], x.shape[1]
-        D = x.shape[-1]
-        if _hc_collapse_kernel is not None:
-            dims_arr = mx.array([D], dtype=mx.int32)
-            collapsed = _hc_collapse_kernel(
-                inputs=[x, pre, dims_arr],
-                template=[("HC", self.hc_mult)],
-                grid=(B * L * 32, 1, 1),
-                threadgroup=(32, 1, 1),
-                output_shapes=[(B, L, D)],
-                output_dtypes=[x.dtype],
-            )[0]
-        else:
-            collapsed = _hc_collapse_op(pre, x)
-        return collapsed, post, comb
+        return _hc_collapse_op(pre, x), post, comb
 
     def expand(
         self,
@@ -922,18 +796,6 @@ class HyperConnection(nn.Module):
         post: mx.array,
         comb: mx.array,
     ):
-        B, L = residual.shape[0], residual.shape[1]
-        D = residual.shape[-1]
-        if _hc_expand_kernel is not None:
-            dims_arr = mx.array([D], dtype=mx.int32)
-            return _hc_expand_kernel(
-                inputs=[block_out, residual, post, comb, dims_arr],
-                template=[("HC", self.hc_mult)],
-                grid=(B * L * self.hc_mult * 32, 1, 1),
-                threadgroup=(32, 1, 1),
-                output_shapes=[(B, L, self.hc_mult, D)],
-                output_dtypes=[residual.dtype],
-            )[0]
         return _hc_expand_op(post, block_out, comb, residual)
 
 
@@ -956,16 +818,6 @@ class HyperHead(nn.Module):
         rsqrt = _rms_rsqrt(flat_f32, self.norm_eps)
         mixes = (flat.astype(self.fn.dtype) @ self.fn.T).astype(mx.float32) * rsqrt
         pre = mx.sigmoid(mixes * self.scale[0] + self.base) + self.hc_eps
-        if _hc_collapse_kernel is not None:
-            dims_arr = mx.array([D], dtype=mx.int32)
-            return _hc_collapse_kernel(
-                inputs=[x, pre, dims_arr],
-                template=[("HC", H)],
-                grid=(B * L * 32, 1, 1),
-                threadgroup=(32, 1, 1),
-                output_shapes=[(B, L, D)],
-                output_dtypes=[x.dtype],
-            )[0]
         return (pre[..., None] * x.astype(mx.float32)).sum(axis=2).astype(x.dtype)
 
 
@@ -989,7 +841,7 @@ class MoEGate(nn.Module):
 
     def __call__(self, x: mx.array, input_ids: Optional[mx.array] = None):
         flat = x.reshape(-1, self.hidden_dim)
-        logits = (flat @ self.weight.T).astype(mx.float32)
+        logits = flat.astype(mx.float32) @ self.weight.T.astype(mx.float32)
         scores = _score_func(logits, self.scoring_func)
 
         if self.hash:
