@@ -340,7 +340,6 @@ def _make_hc_split_sinkhorn_kernel():
 
     source = """
         uint idx = thread_position_in_grid.x;
-        if (idx >= (uint)n_rows[0]) return;
         constexpr int MIX = (2 + HC) * HC;
         float epsv = static_cast<float>(eps[0]);
 
@@ -417,7 +416,7 @@ def _make_hc_split_sinkhorn_kernel():
 
     return mx.fast.metal_kernel(
         name="deepseek_v4_hc_split_sinkhorn",
-        input_names=["mixes", "scale", "base", "eps", "n_rows"],
+        input_names=["mixes", "scale", "base", "eps"],
         output_names=["pre", "post", "comb"],
         source=source,
     )
@@ -440,11 +439,10 @@ def hc_split_sinkhorn(
     if not isinstance(eps, mx.array):
         eps = mx.array([eps], dtype=mx.float32)
     n_rows = mixes.size // ((2 + hc_mult) * hc_mult)
-    n_rows_arr = mx.array([n_rows], dtype=mx.int32)
     return _hc_split_sinkhorn_kernel(
-        inputs=[mixes, scale, base, eps, n_rows_arr],
+        inputs=[mixes, scale, base, eps],
         template=[("HC", hc_mult), ("ITERS", sinkhorn_iters)],
-        grid=((n_rows + 255) & ~255, 1, 1),
+        grid=(n_rows, 1, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[
             (*mixes.shape[:-1], hc_mult),
@@ -477,220 +475,6 @@ def _rms_rsqrt(flat: mx.array, eps: float) -> mx.array:
     return mx.rsqrt((flat * flat).mean(axis=-1, keepdims=True) + eps)
 
 
-def _make_fused_sparse_attn_kernel():
-    if mx.default_device() != mx.gpu or not mx.metal.is_available():
-        return None
-
-    source = """
-        uint tid = thread_position_in_threadgroup.x;
-        uint gid = threadgroup_position_in_grid.x;
-
-        constexpr int TPH = 4;
-        constexpr int DPT = D / TPH;
-        uint head = tid / TPH;
-        uint lane = tid % TPH;
-        uint d_off = lane * DPT;
-        if (head >= (uint)H) return;
-
-        int L_v = dims[0], T_v = dims[1], C_v = dims[2], K_v = dims[3];
-        uint b = gid / (uint)L_v;
-        uint l = gid % (uint)L_v;
-
-        // Load q chunk into registers
-        float qr[DPT];
-        {
-            auto p = q + ((uint64_t)b*H*L_v + head*L_v + l) * D;
-            for (int i = 0; i < DPT; i++) qr[i] = float(p[d_off + i]);
-        }
-
-        float m_cur = -1e38f, l_sum = 0.f;
-        float acc[DPT];
-        for (int i = 0; i < DPT; i++) acc[i] = 0.f;
-        float sc = float(scale_val[0]);
-
-        // --- Local KV with mask ---
-        {
-            auto kv_base = local_kv + (uint64_t)b * T_v * D;
-            auto m_base = local_mask + ((uint64_t)b * L_v + l) * T_v;
-            for (int t = 0; t < T_v; t++) {
-                float mv = float(m_base[t]);
-                if (mv < -1e9f) continue;
-
-                auto kvp = kv_base + (uint64_t)t * D;
-                float kvr[DPT];
-                float dot = 0.f;
-                for (int i = 0; i < DPT; i++) {
-                    kvr[i] = float(kvp[d_off + i]);
-                    dot = fma(qr[i], kvr[i], dot);
-                }
-
-                float s = dot;
-                for (int o = 1; o < TPH; o <<= 1)
-                    s += simd_shuffle_xor(s, o);
-                s = fma(s, sc, mv);
-
-                float mn = max(m_cur, s);
-                float corr = metal::fast::exp(m_cur - mn);
-                float p = metal::fast::exp(s - mn);
-                l_sum = fma(corr, l_sum, p);
-                for (int i = 0; i < DPT; i++)
-                    acc[i] = fma(corr, acc[i], p * kvr[i]);
-                m_cur = mn;
-            }
-        }
-
-        // --- Sparse (compressed) KV via index gather ---
-        {
-            auto ckv = compressed_kv + (uint64_t)b * C_v * D;
-            auto ip = topk_idxs + ((uint64_t)b * L_v + l) * K_v;
-            for (int k = 0; k < K_v; k++) {
-                int idx = int(ip[k]);
-                if (idx < 0) continue;
-
-                auto kvp = ckv + (uint64_t)idx * D;
-                float kvr[DPT];
-                float dot = 0.f;
-                for (int i = 0; i < DPT; i++) {
-                    kvr[i] = float(kvp[d_off + i]);
-                    dot = fma(qr[i], kvr[i], dot);
-                }
-
-                float s = dot;
-                for (int o = 1; o < TPH; o <<= 1)
-                    s += simd_shuffle_xor(s, o);
-                s *= sc;
-
-                float mn = max(m_cur, s);
-                float corr = metal::fast::exp(m_cur - mn);
-                float p = metal::fast::exp(s - mn);
-                l_sum = fma(corr, l_sum, p);
-                for (int i = 0; i < DPT; i++)
-                    acc[i] = fma(corr, acc[i], p * kvr[i]);
-                m_cur = mn;
-            }
-        }
-
-        // --- Attention sink (score = attn_sink[h], value = 0) ---
-        {
-            float ss = float(attn_sink[head]);
-            float mn = max(m_cur, ss);
-            float corr = metal::fast::exp(m_cur - mn);
-            l_sum = fma(corr, l_sum, metal::fast::exp(ss - mn));
-            for (int i = 0; i < DPT; i++) acc[i] *= corr;
-            m_cur = mn;
-        }
-
-        // --- Normalize and write ---
-        {
-            float inv_l = 1.f / max(l_sum, 1e-6f);
-            auto op = out + ((uint64_t)b*H*L_v + head*L_v + l) * D;
-            for (int i = 0; i < DPT; i++)
-                store_elem(op[d_off + i], acc[i] * inv_l);
-        }
-    """
-
-    return mx.fast.metal_kernel(
-        name="ds4_fused_sparse_attn",
-        input_names=[
-            "q",
-            "local_kv",
-            "compressed_kv",
-            "topk_idxs",
-            "local_mask",
-            "attn_sink",
-            "scale_val",
-            "dims",
-        ],
-        output_names=["out"],
-        header="template<typename T> inline void store_elem(device T& dst, float v) { dst = T(v); }",
-        source=source,
-    )
-
-
-_fused_sparse_attn_kernel = _make_fused_sparse_attn_kernel()
-
-
-@mx.compile
-def fused_sparse_attention(
-    q: mx.array,
-    local_kv: mx.array,
-    compressed_kv: mx.array,
-    topk_idxs: mx.array,
-    local_mask: Optional[mx.array],
-    scale: float,
-    attn_sink: mx.array,
-) -> mx.array:
-    """Fused sparse attention: local window + index-gathered compressed KV.
-
-    Uses online softmax (FlashAttention-style) to compute attention over local
-    sliding-window KV and per-query sparse compressed KV in a single Metal
-    kernel pass.  Avoids materializing the [B, L, topk, D] gathered tensor
-    and all intermediate score/exp tensors.
-    """
-    B, H, L, D = q.shape
-    T = local_kv.shape[2]
-    C = compressed_kv.shape[1]
-    K = topk_idxs.shape[2]
-
-    # The Metal kernel is a GEMV-style kernel optimised for single-token decode.
-    # For prefill (L > 1) MLX matrix ops (_split_sparse_attention) are faster.
-    if _fused_sparse_attn_kernel is None or L > 1:
-        expanded = mx.broadcast_to(
-            compressed_kv[:, None, :, :],
-            (B, L, C, D),
-        )
-        idx = topk_idxs[:, :, :, None]
-        sparse_kv = mx.take_along_axis(
-            expanded,
-            mx.broadcast_to(idx, idx.shape[:-1] + (D,)),
-            axis=2,
-        )
-        return _split_sparse_attention(
-            q,
-            local_kv,
-            sparse_kv,
-            local_mask,
-            scale,
-            attn_sink,
-        )
-
-    # Pad mask if local_kv grew beyond mask width
-    if local_mask is not None and T > local_mask.shape[-1]:
-        pad = mx.zeros(
-            local_mask.shape[:-1] + (T - local_mask.shape[-1],),
-            dtype=local_mask.dtype,
-        )
-        local_mask = mx.concatenate([local_mask, pad], axis=-1)
-
-    # Squeeze broadcast dims for contiguous flat access in kernel
-    lkv = local_kv.reshape(B, T, D)
-    lm = (
-        local_mask.reshape(B, L, T).astype(mx.float32)
-        if local_mask is not None
-        else mx.zeros((B, L, T), dtype=mx.float32)
-    )
-
-    dims = mx.array([L, T, C, K], dtype=mx.int32)
-    sc = mx.array([scale], dtype=mx.float32)
-    sink = attn_sink.astype(mx.float32)
-
-    return _fused_sparse_attn_kernel(
-        inputs=[
-            q,
-            lkv,
-            compressed_kv,
-            topk_idxs.astype(mx.int32),
-            lm,
-            sink,
-            sc,
-            dims,
-        ],
-        template=[("H", H), ("D", D)],
-        grid=(B * L * H * 4, 1, 1),
-        threadgroup=(H * 4, 1, 1),
-        output_shapes=[(B, H, L, D)],
-        output_dtypes=[q.dtype],
-    )[0]
 
 
 class HyperConnection(nn.Module):
@@ -702,7 +486,7 @@ class HyperConnection(nn.Module):
         self._hc_eps = (mx.array([config.hc_eps], dtype=mx.float32),)
         self.norm_eps = config.rms_norm_eps
         mix = (2 + self.hc_mult) * self.hc_mult
-        self.fn = mx.zeros((mix, self.hc_mult * config.hidden_size), dtype=mx.bfloat16)
+        self.fn = mx.zeros((mix, self.hc_mult * config.hidden_size))
         self.base = mx.zeros((mix,), dtype=mx.float32)
         self.scale = mx.ones((3,), dtype=mx.float32)
 
@@ -711,8 +495,7 @@ class HyperConnection(nn.Module):
         flat = x.reshape(B, L, H * D)
         flat_f32 = flat.astype(mx.float32)
         rsqrt = _rms_rsqrt(flat_f32, self.norm_eps)
-        # fn is bfloat16; match flat's dtype so MLX uses a native bf16 GEMV.
-        mixes = (flat.astype(self.fn.dtype) @ self.fn.T).astype(mx.float32) * rsqrt
+        mixes = (flat @ self.fn.T) * rsqrt
         split_sinkhorn = _hc_split_sinkhorn_ops if self.training else hc_split_sinkhorn
         return split_sinkhorn(
             mixes,
@@ -744,7 +527,7 @@ class HyperHead(nn.Module):
         self.norm_eps = config.rms_norm_eps
         self.hc_eps = config.hc_eps
         self.fn = mx.zeros(
-            (self.hc_mult, self.hc_mult * config.hidden_size), dtype=mx.bfloat16
+            (self.hc_mult, self.hc_mult * config.hidden_size)
         )
         self.base = mx.zeros((self.hc_mult,), dtype=mx.float32)
         self.scale = mx.ones((1,), dtype=mx.float32)
@@ -754,7 +537,7 @@ class HyperHead(nn.Module):
         flat = x.reshape(B, L, H * D)
         flat_f32 = flat.astype(mx.float32)
         rsqrt = _rms_rsqrt(flat_f32, self.norm_eps)
-        mixes = (flat.astype(self.fn.dtype) @ self.fn.T).astype(mx.float32) * rsqrt
+        mixes = (flat @ self.fn.T) * rsqrt
         pre = mx.sigmoid(mixes * self.scale[0] + self.base) + self.hc_eps
         return (pre[..., None] * x.astype(mx.float32)).sum(axis=2).astype(x.dtype)
 
@@ -1521,11 +1304,6 @@ class Compressor(nn.Module):
 
 
 class Indexer(nn.Module):
-    # NOTE: Hadamard rotation omitted (see Compressor note above).
-    # NOTE: FP4 query simulation omitted. The HF reference quantizes Q to FP4
-    # before scoring compressed KV for training/inference parity. Running with
-    # full-precision queries gives slightly different top-k selections on edge
-    # cases, but the top-k selection is robust enough that this rarely matters.
     def __init__(self, config: ModelArgs, compress_ratio: int):
         super().__init__()
         self.n_heads = config.index_n_heads
@@ -1767,33 +1545,37 @@ class V4Attention(nn.Module):
         full_kv = kv
         local_kv_len = kv.shape[2]
 
-        fused_out = None
+        sparse_out = None
         if self.compress_ratio:
             v4_cache = cache if isinstance(cache, DeepseekV4Cache) else None
             pooled = self.compressor(x, self.compress_rope, v4_cache, offset)
             if pooled.shape[1] > 0:
                 if hasattr(self, "indexer") and L > 1:
-
                     topk = self.indexer(
                         x, q_residual, self.compress_rope, self.rope, v4_cache, offset
                     )
                     if topk is not None:
-                        fused_out = fused_sparse_attention(
-                            q,
-                            full_kv,
-                            pooled,
-                            topk,
-                            mask,
-                            self.scale,
-                            self.attn_sink.astype(q.dtype),
+                        B, C, D = pooled.shape[0], pooled.shape[1], pooled.shape[2]
+                        expanded = mx.broadcast_to(
+                            pooled[:, None, :, :], (B, L, C, D)
+                        )
+                        idx = topk[:, :, :, None]
+                        sparse_kv = mx.take_along_axis(
+                            expanded,
+                            mx.broadcast_to(idx, idx.shape[:-1] + (D,)),
+                            axis=2,
+                        )
+                        sparse_out = _split_sparse_attention(
+                            q, full_kv, sparse_kv, mask,
+                            self.scale, self.attn_sink.astype(q.dtype),
                         )
                     else:
                         full_kv = mx.concatenate([full_kv, pooled[:, None]], axis=2)
                 else:
                     full_kv = mx.concatenate([full_kv, pooled[:, None]], axis=2)
 
-        if fused_out is not None:
-            out = fused_out
+        if sparse_out is not None:
+            out = sparse_out
         else:
             if mask is not None and full_kv.shape[2] > mask.shape[-1]:
                 pad = mx.ones(
@@ -1924,16 +1706,6 @@ class Model(nn.Module):
             return not (
                 "attn_sink" in k
                 or "e_score_correction_bias" in k
-                or k.endswith(
-                    (
-                        ".attn_hc.base",
-                        ".attn_hc.scale",
-                        ".ffn_hc.base",
-                        ".ffn_hc.scale",
-                        ".hc_head.base",
-                        ".hc_head.scale",
-                    )
-                )
             )
 
         return predicate
