@@ -434,6 +434,200 @@ def _rms_rsqrt(flat: mx.array, eps: float) -> mx.array:
     return mx.rsqrt((flat * flat).mean(axis=-1, keepdims=True) + eps)
 
 
+def _make_fused_sparse_attn_kernel():
+    if mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return None
+
+    source = """
+        uint tid = thread_position_in_threadgroup.x;
+        uint gid = thread_position_in_grid.x;
+
+        constexpr int TPH = 4;
+        constexpr int DPT = D / TPH;
+        uint head = tid / TPH;
+        uint lane = tid % TPH;
+        uint d_off = lane * DPT;
+        if (head >= (uint)H) return;
+
+        int L_v = dims[0], T_v = dims[1], C_v = dims[2], K_v = dims[3];
+        uint b = gid / (uint)L_v;
+        uint l = gid % (uint)L_v;
+
+        // Load q chunk into registers
+        float qr[DPT];
+        {
+            const device auto* p = q + ((uint64_t)b*H*L_v + head*L_v + l) * D;
+            for (int i = 0; i < DPT; i++) qr[i] = float(p[d_off + i]);
+        }
+
+        float m_cur = -1e38f, l_sum = 0.f;
+        float acc[DPT];
+        for (int i = 0; i < DPT; i++) acc[i] = 0.f;
+        float sc = float(scale_val[0]);
+
+        // --- Local KV with mask ---
+        {
+            const device auto* kv_base = local_kv + (uint64_t)b * T_v * D;
+            const device auto* m_base = local_mask + ((uint64_t)b * L_v + l) * T_v;
+            for (int t = 0; t < T_v; t++) {
+                float mv = float(m_base[t]);
+                if (mv < -1e9f) continue;
+
+                const device auto* kvp = kv_base + (uint64_t)t * D;
+                float kvr[DPT];
+                float dot = 0.f;
+                for (int i = 0; i < DPT; i++) {
+                    kvr[i] = float(kvp[d_off + i]);
+                    dot = fma(qr[i], kvr[i], dot);
+                }
+
+                float s = dot;
+                for (int o = 1; o < TPH; o <<= 1)
+                    s += simd_shuffle_xor(s, o);
+                s = fma(s, sc, mv);
+
+                float mn = max(m_cur, s);
+                float corr = metal::fast::exp(m_cur - mn);
+                float p = metal::fast::exp(s - mn);
+                l_sum = fma(corr, l_sum, p);
+                for (int i = 0; i < DPT; i++)
+                    acc[i] = fma(corr, acc[i], p * kvr[i]);
+                m_cur = mn;
+            }
+        }
+
+        // --- Sparse (compressed) KV via index gather ---
+        {
+            const device auto* ckv = compressed_kv + (uint64_t)b * C_v * D;
+            const device auto* ip = topk_idxs + ((uint64_t)b * L_v + l) * K_v;
+            for (int k = 0; k < K_v; k++) {
+                int idx = int(ip[k]);
+                if (idx < 0) continue;
+
+                const device auto* kvp = ckv + (uint64_t)idx * D;
+                float kvr[DPT];
+                float dot = 0.f;
+                for (int i = 0; i < DPT; i++) {
+                    kvr[i] = float(kvp[d_off + i]);
+                    dot = fma(qr[i], kvr[i], dot);
+                }
+
+                float s = dot;
+                for (int o = 1; o < TPH; o <<= 1)
+                    s += simd_shuffle_xor(s, o);
+                s *= sc;
+
+                float mn = max(m_cur, s);
+                float corr = metal::fast::exp(m_cur - mn);
+                float p = metal::fast::exp(s - mn);
+                l_sum = fma(corr, l_sum, p);
+                for (int i = 0; i < DPT; i++)
+                    acc[i] = fma(corr, acc[i], p * kvr[i]);
+                m_cur = mn;
+            }
+        }
+
+        // --- Attention sink (score = attn_sink[h], value = 0) ---
+        {
+            float ss = float(attn_sink[head]);
+            float mn = max(m_cur, ss);
+            float corr = metal::fast::exp(m_cur - mn);
+            l_sum = fma(corr, l_sum, metal::fast::exp(ss - mn));
+            for (int i = 0; i < DPT; i++) acc[i] *= corr;
+            m_cur = mn;
+        }
+
+        // --- Normalize and write ---
+        {
+            float inv_l = 1.f / max(l_sum, 1e-6f);
+            device auto* op = out + ((uint64_t)b*H*L_v + head*L_v + l) * D;
+            for (int i = 0; i < DPT; i++)
+                op[d_off + i] = decltype(*op)(acc[i] * inv_l);
+        }
+    """
+
+    return mx.fast.metal_kernel(
+        name="ds4_fused_sparse_attn",
+        input_names=[
+            "q", "local_kv", "compressed_kv", "topk_idxs",
+            "local_mask", "attn_sink", "scale_val", "dims",
+        ],
+        output_names=["out"],
+        source=source,
+    )
+
+
+_fused_sparse_attn_kernel = _make_fused_sparse_attn_kernel()
+
+
+def fused_sparse_attention(
+    q: mx.array,
+    local_kv: mx.array,
+    compressed_kv: mx.array,
+    topk_idxs: mx.array,
+    local_mask: Optional[mx.array],
+    scale: float,
+    attn_sink: mx.array,
+) -> mx.array:
+    """Fused sparse attention: local window + index-gathered compressed KV.
+
+    Uses online softmax (FlashAttention-style) to compute attention over local
+    sliding-window KV and per-query sparse compressed KV in a single Metal
+    kernel pass.  Avoids materializing the [B, L, topk, D] gathered tensor
+    and all intermediate score/exp tensors.
+    """
+    B, H, L, D = q.shape
+    T = local_kv.shape[2]
+    C = compressed_kv.shape[1]
+    K = topk_idxs.shape[2]
+
+    if _fused_sparse_attn_kernel is None:
+        expanded = mx.broadcast_to(
+            compressed_kv[:, None, :, :],
+            (B, L, C, D),
+        )
+        idx = topk_idxs[:, :, :, None]
+        sparse_kv = mx.take_along_axis(
+            expanded, mx.broadcast_to(idx, idx.shape[:-1] + (D,)), axis=2,
+        )
+        return _split_sparse_attention(
+            q, local_kv, sparse_kv, local_mask, scale, attn_sink,
+        )
+
+    # Pad mask if local_kv grew beyond mask width
+    if local_mask is not None and T > local_mask.shape[-1]:
+        pad = mx.zeros(
+            local_mask.shape[:-1] + (T - local_mask.shape[-1],),
+            dtype=local_mask.dtype,
+        )
+        local_mask = mx.concatenate([local_mask, pad], axis=-1)
+
+    # Squeeze broadcast dims for contiguous flat access in kernel
+    lkv = local_kv.reshape(B, T, D)
+    lm = (
+        local_mask.reshape(B, L, T).astype(mx.float32)
+        if local_mask is not None
+        else mx.zeros((B, L, T), dtype=mx.float32)
+    )
+
+    dims = mx.array([L, T, C, K], dtype=mx.int32)
+    sc = mx.array([scale], dtype=mx.float32)
+    sink = attn_sink.astype(mx.float32)
+
+    return _fused_sparse_attn_kernel(
+        inputs=[
+            q, lkv, compressed_kv,
+            topk_idxs.astype(mx.int32),
+            lm, sink, sc, dims,
+        ],
+        template=[("H", H), ("D", D)],
+        grid=(B * L, 1, 1),
+        threadgroup=(H * 4, 1, 1),
+        output_shapes=[(B, H, L, D)],
+        output_dtypes=[q.dtype],
+    )[0]
+
+
 class HyperConnection(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
@@ -1504,7 +1698,7 @@ class V4Attention(nn.Module):
         full_kv = kv
         local_kv_len = kv.shape[2]
 
-        sparse_kv = None
+        fused_out = None
         if self.compress_ratio:
             v4_cache = cache if isinstance(cache, DeepseekV4Cache) else None
             pooled = self.compressor(x, self.compress_rope, v4_cache, offset)
@@ -1527,18 +1721,11 @@ class V4Attention(nn.Module):
                     x, q_residual, self.compress_rope, self.rope, v4_cache, offset
                 )
                 if topk is not None and L > 1:
-                    # Prefill: gather per-query keys [B, L, topk, D] and use
-                    # split sparse attention to avoid materializing
-                    # [B, H, L, T_local + L*topk] scores.
-                    expanded = mx.broadcast_to(
-                        pooled[:, None, :, :],
-                        (B, L, pooled.shape[1], self.head_dim),
-                    )
-                    idx = topk[:, :, :, None]
-                    sparse_kv = mx.take_along_axis(
-                        expanded,
-                        mx.broadcast_to(idx, idx.shape[:-1] + (self.head_dim,)),
-                        axis=2,
+                    # Prefill: fused sparse attention gathers compressed KV
+                    # on the fly, avoiding [B, L, topk, D] intermediate.
+                    fused_out = fused_sparse_attention(
+                        q, full_kv, pooled, topk, mask,
+                        self.scale, self.attn_sink.astype(q.dtype),
                     )
                 elif topk is not None:
                     # Generation (L==1): flatten is safe, use SDPA for speed.
@@ -1559,11 +1746,8 @@ class V4Attention(nn.Module):
                 if pooled.shape[1] > 0:
                     full_kv = mx.concatenate([full_kv, pooled[:, None]], axis=2)
 
-        if sparse_kv is not None:
-            out = _split_sparse_attention(
-                q, full_kv, sparse_kv, mask,
-                self.scale, self.attn_sink.astype(q.dtype),
-            )
+        if fused_out is not None:
+            out = fused_out
         else:
             if mask is not None and full_kv.shape[2] > mask.shape[-1]:
                 pad = mx.ones(
