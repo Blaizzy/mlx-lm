@@ -2034,13 +2034,9 @@ class Model(nn.Module):
                             weights.pop(f"{prefix}.{e}.{src}.{suffix}")
                             for e in range(self.args.n_routed_experts)
                         ]
-                        if suffix != "biases":
-                            weights[dst_key] = mx.stack(stacked)
+                        weights[dst_key] = mx.stack(stacked)
                     elif pre_stacked_key in weights:
-                        if suffix != "biases":
-                            weights[dst_key] = weights.pop(pre_stacked_key)
-                        else:
-                            weights.pop(pre_stacked_key)
+                        weights[dst_key] = weights.pop(pre_stacked_key)
 
         # Stack grouped wo_a.0..N into single wo_a (concat along output dim)
         o_groups = self.args.o_groups
