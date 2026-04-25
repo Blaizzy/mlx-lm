@@ -241,6 +241,60 @@ def _rope_full(
     return pe_out
 
 
+def _make_partial_rope_kernel():
+    if mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return None
+
+    source = """
+        uint tid = thread_position_in_threadgroup.x;  // 0..31 (one SIMD group)
+        uint gid = threadgroup_position_in_grid.x;    // one per (b, h, l) triplet
+
+        constexpr int D = NOPE + 2 * DRH;
+        int L_v = dims[0];
+        int H_v = dims[1];
+        uint l   = gid % (uint)L_v;
+        uint tmp = gid / (uint)L_v;
+        uint h   = tmp % (uint)H_v;
+        uint b   = tmp / (uint)H_v;
+
+        const auto xp = x     + ((uint64_t)b * H_v * L_v + h * L_v + l) * D;
+        auto       yp = y     + ((uint64_t)b * H_v * L_v + h * L_v + l) * D;
+        const auto cp = cos_s + l * DRH;
+        const auto sp = sin_s + l * DRH;
+
+        // Copy the nope prefix (stride-32 coalesced across the SIMD group)
+        for (int i = (int)tid; i < NOPE; i += 32)
+            store_elem(yp[i], float(xp[i]));
+
+        // Apply RoPE rotation to the trailing D_ROPE = 2*DRH elements.
+        // Pairs are interleaved: (x[2i], x[2i+1]) rotated by freq i.
+        // Each of the 32 lanes handles one interleaved pair.
+        if ((int)tid < DRH) {
+            float x0 = float(xp[NOPE + 2 * tid]);
+            float x1 = float(xp[NOPE + 2 * tid + 1]);
+            float c  = float(cp[tid]);
+            float s  = float(sp[tid]);
+            if (INVERSE) {
+                store_elem(yp[NOPE + 2 * tid],     fma( x1, s, x0 * c));   //  x0*c + x1*s
+                store_elem(yp[NOPE + 2 * tid + 1], fma(-x0, s, x1 * c));   // -x0*s + x1*c
+            } else {
+                store_elem(yp[NOPE + 2 * tid],     fma(-x1, s, x0 * c));   //  x0*c - x1*s
+                store_elem(yp[NOPE + 2 * tid + 1], fma( x0, s, x1 * c));   //  x0*s + x1*c
+            }
+        }
+    """
+    return mx.fast.metal_kernel(
+        name="ds4_partial_rope",
+        input_names=["x", "cos_s", "sin_s", "dims"],
+        output_names=["y"],
+        header="template<typename T> inline void store_elem(device T& dst, float v) { dst = T(v); }",
+        source=source,
+    )
+
+
+_partial_rope_kernel = _make_partial_rope_kernel()
+
+
 def _apply_partial_rope(
     x: mx.array,
     rope: DeepseekV4RoPE,
@@ -248,8 +302,35 @@ def _apply_partial_rope(
     inverse: bool = False,
     positions: Optional[mx.array] = None,
 ) -> mx.array:
-    nope_dim = x.shape[-1] - rope.dims if x.shape[-1] != rope.dims else 0
+    rope_dim = rope.dims
+    nope_dim = x.shape[-1] - rope_dim
     L = x.shape[-2]
+
+    if _partial_rope_kernel is not None:
+        B, H = x.shape[0], x.shape[1]
+        pos = (
+            mx.arange(offset, offset + L, dtype=mx.float32)
+            if positions is None
+            else positions.astype(mx.float32)
+        )
+        freqs = pos[:, None] * rope.inv_freq[None, :]
+        cos = mx.cos(freqs).astype(mx.float32)
+        sin = mx.sin(freqs).astype(mx.float32)
+        dims_arr = mx.array([L, H], dtype=mx.int32)
+        return _partial_rope_kernel(
+            inputs=[x, cos, sin, dims_arr],
+            template=[
+                ("NOPE", nope_dim),
+                ("DRH", rope_dim // 2),
+                ("INVERSE", 1 if inverse else 0),
+            ],
+            grid=(B * H * L * 32, 1, 1),
+            threadgroup=(32, 1, 1),
+            output_shapes=[x.shape],
+            output_dtypes=[x.dtype],
+        )[0]
+
+    # Fallback: _rope_full compiled function
     if positions is None:
         pos = mx.arange(L, dtype=mx.float32)
         if isinstance(offset, mx.array):
