@@ -74,8 +74,8 @@ class ModelArgs(BaseModelArgs):
         bad = [r for r in self.compress_ratios if r not in (0, 4, 128)]
         if bad:
             raise ValueError(f"Unsupported DeepSeek-V4 compress ratios: {bad}")
-        if self.quantization is None:
-            self.quantization = _default_quantization()
+        if self.quantization_config is None:
+            self.quantization_config = _default_quantization()
 
 
 def _score_func(scores: mx.array, func: str) -> mx.array:
