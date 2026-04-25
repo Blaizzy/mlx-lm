@@ -440,7 +440,7 @@ def _make_fused_sparse_attn_kernel():
 
     source = """
         uint tid = thread_position_in_threadgroup.x;
-        uint gid = thread_position_in_grid.x;
+        uint gid = threadgroup_position_in_grid.x;
 
         constexpr int TPH = 4;
         constexpr int DPT = D / TPH;
@@ -456,7 +456,7 @@ def _make_fused_sparse_attn_kernel():
         // Load q chunk into registers
         float qr[DPT];
         {
-            const device auto* p = q + ((uint64_t)b*H*L_v + head*L_v + l) * D;
+            auto p = q + ((uint64_t)b*H*L_v + head*L_v + l) * D;
             for (int i = 0; i < DPT; i++) qr[i] = float(p[d_off + i]);
         }
 
@@ -467,13 +467,13 @@ def _make_fused_sparse_attn_kernel():
 
         // --- Local KV with mask ---
         {
-            const device auto* kv_base = local_kv + (uint64_t)b * T_v * D;
-            const device auto* m_base = local_mask + ((uint64_t)b * L_v + l) * T_v;
+            auto kv_base = local_kv + (uint64_t)b * T_v * D;
+            auto m_base = local_mask + ((uint64_t)b * L_v + l) * T_v;
             for (int t = 0; t < T_v; t++) {
                 float mv = float(m_base[t]);
                 if (mv < -1e9f) continue;
 
-                const device auto* kvp = kv_base + (uint64_t)t * D;
+                auto kvp = kv_base + (uint64_t)t * D;
                 float kvr[DPT];
                 float dot = 0.f;
                 for (int i = 0; i < DPT; i++) {
@@ -498,13 +498,13 @@ def _make_fused_sparse_attn_kernel():
 
         // --- Sparse (compressed) KV via index gather ---
         {
-            const device auto* ckv = compressed_kv + (uint64_t)b * C_v * D;
-            const constant int32_t* ip = topk_idxs + ((uint64_t)b * L_v + l) * K_v;
+            auto ckv = compressed_kv + (uint64_t)b * C_v * D;
+            auto ip = topk_idxs + ((uint64_t)b * L_v + l) * K_v;
             for (int k = 0; k < K_v; k++) {
                 int idx = int(ip[k]);
                 if (idx < 0) continue;
 
-                const device auto* kvp = ckv + (uint64_t)idx * D;
+                auto kvp = ckv + (uint64_t)idx * D;
                 float kvr[DPT];
                 float dot = 0.f;
                 for (int i = 0; i < DPT; i++) {
@@ -540,9 +540,9 @@ def _make_fused_sparse_attn_kernel():
         // --- Normalize and write ---
         {
             float inv_l = 1.f / max(l_sum, 1e-6f);
-            device auto* op = out + ((uint64_t)b*H*L_v + head*L_v + l) * D;
+            auto op = out + ((uint64_t)b*H*L_v + head*L_v + l) * D;
             for (int i = 0; i < DPT; i++)
-                op[d_off + i] = static_cast<remove_reference_t<decltype(*op)>>(acc[i] * inv_l);
+                store_elem(op[d_off + i], acc[i] * inv_l);
         }
     """
 
@@ -553,6 +553,7 @@ def _make_fused_sparse_attn_kernel():
             "local_mask", "attn_sink", "scale_val", "dims",
         ],
         output_names=["out"],
+        header="template<typename T> inline void store_elem(device T& dst, float v) { dst = T(v); }",
         source=source,
     )
 
@@ -621,7 +622,7 @@ def fused_sparse_attention(
             lm, sink, sc, dims,
         ],
         template=[("H", H), ("D", D)],
-        grid=(B * L, 1, 1),
+        grid=(B * L * H * 4, 1, 1),
         threadgroup=(H * 4, 1, 1),
         output_shapes=[(B, H, L, D)],
         output_dtypes=[q.dtype],
