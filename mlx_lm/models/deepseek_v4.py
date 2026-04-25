@@ -713,7 +713,9 @@ def fused_sparse_attention(
     C = compressed_kv.shape[1]
     K = topk_idxs.shape[2]
 
-    if _fused_sparse_attn_kernel is None:
+    # The Metal kernel is a GEMV-style kernel optimised for single-token decode.
+    # For prefill (L > 1) MLX matrix ops (_split_sparse_attention) are faster.
+    if _fused_sparse_attn_kernel is None or L > 1:
         expanded = mx.broadcast_to(
             compressed_kv[:, None, :, :],
             (B, L, C, D),
