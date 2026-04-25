@@ -922,9 +922,8 @@ class DeepseekV4Cache:
 
     def __init__(self, sliding_window: int):
         self.local = RotatingKVCache(max_size=sliding_window, keep=0)
-        self.compressor_state = self._new_branch_state()
-        self.indexer_state = self._new_branch_state()
-        self._pending_lengths = None
+        self.compressor_state = {"buffer_x": None, "pooled": None}
+        self.indexer_state = {"buffer_x": None, "pooled": None}
 
     @property
     def offset(self):
@@ -943,8 +942,8 @@ class DeepseekV4Cache:
         local_state = None if self.local.empty() else self.local.state
         return (
             local_state,
-            self._branch_state_tuple(self.compressor_state),
-            self._branch_state_tuple(self.indexer_state),
+            tuple(self.compressor_state[k] for k in ("buffer_x", "pooled")),
+            tuple(self.indexer_state[k] for k in ("buffer_x", "pooled")),
         )
 
     @state.setter
@@ -955,8 +954,8 @@ class DeepseekV4Cache:
             self.local.values = None
         else:
             self.local.state = local_state
-        self.compressor_state = self._state_from_tuple(compressor_state)
-        self.indexer_state = self._state_from_tuple(indexer_state)
+        self.compressor_state = dict(zip(("buffer_x", "pooled"), compressor_state))
+        self.indexer_state = dict(zip(("buffer_x", "pooled"), indexer_state))
 
     @property
     def meta_state(self):
@@ -1019,142 +1018,27 @@ class DeepseekV4Cache:
             else self.compressor_state
         )
 
-    @classmethod
-    def _new_branch_state(cls):
-        return {key: None for key in cls._state_keys + cls._length_keys}
-
-    @classmethod
-    def _branch_state_tuple(cls, state):
-        return tuple(state[k] for k in cls._state_keys + cls._length_keys)
-
-    @classmethod
-    def _state_from_tuple(cls, values):
-        keys = cls._state_keys + cls._length_keys
-        state = cls._new_branch_state()
-        state.update(zip(keys, values))
-        return state
-
-    @staticmethod
-    def _lengths_list(lengths, batch_size: int, default: Optional[int] = None):
-        if lengths is None:
-            if default is None:
-                return None
-            return [default] * batch_size
-        if isinstance(lengths, mx.array):
-            lengths = lengths.tolist()
-        return [int(length) for length in lengths]
-
-    @staticmethod
-    def _filter_lengths(lengths, batch_indices):
-        if lengths is None:
-            return None
-        if isinstance(lengths, mx.array):
-            lengths = lengths.tolist()
-        if isinstance(batch_indices, mx.array):
-            batch_indices = batch_indices.tolist()
-        if len(lengths) == 1 and any(idx != 0 for idx in batch_indices):
-            lengths = lengths * (max(batch_indices) + 1)
-        return [int(lengths[idx]) for idx in batch_indices]
-
-    def accumulate_windows(
+    def accumulate_x_windows(
         self,
-        kv: mx.array,
-        gate: mx.array,
+        x: mx.array,
         state_key: str,
         ratio: int,
         start_pos: int,
     ):
+        """Buffer raw hidden states; return the ready portion and pool_base.
+
+        By buffering x instead of (kv, gate), the expensive wkv/wgate GEMVs in
+        Compressor are deferred until a full window is ready — saving (ratio-1)/ratio
+        of those GEMVs during single-token decode steps.
+        """
         state = self._branch_state(state_key)
-        buf_kv, buf_gate = state["buffer_kv"], state["buffer_gate"]
-        B, L = kv.shape[:2]
-        buf_lengths = self._lengths_list(state["buffer_lengths"], B)
-        chunk_lengths = self._pending_lengths
-        if buf_lengths is None and chunk_lengths is None:
-            if buf_kv is not None and buf_kv.shape[1]:
-                kv = mx.concatenate([buf_kv, kv], axis=1)
-                gate = mx.concatenate([buf_gate, gate], axis=1)
-            usable = (kv.shape[1] // ratio) * ratio
-            state["buffer_kv"] = kv[:, usable:]
-            state["buffer_gate"] = gate[:, usable:]
-            state["buffer_lengths"] = None
-            state["_new_pooled_lengths"] = None
-            if isinstance(start_pos, mx.array):
-                pool_base = mx.maximum(start_pos, 0)
-            else:
-                pool_base = max(0, start_pos)
-            pool_base = pool_base - (buf_kv.shape[1] if buf_kv is not None else 0)
-            return kv[:, :usable], gate[:, :usable], pool_base
-
-        buf_lengths = self._lengths_list(
-            state["buffer_lengths"],
-            B,
-            0 if buf_kv is None else buf_kv.shape[1],
-        )
-        chunk_lengths = self._lengths_list(chunk_lengths, B, L)
-        total_lengths = [
-            buf_length + min(chunk_length, L)
-            for buf_length, chunk_length in zip(buf_lengths, chunk_lengths)
-        ]
-        usable_lengths = [(length // ratio) * ratio for length in total_lengths]
-        buffer_lengths = [
-            length - usable for length, usable in zip(total_lengths, usable_lengths)
-        ]
-        max_total = max(total_lengths, default=0)
-        max_usable = max(usable_lengths, default=0)
-        max_buffer = max(buffer_lengths, default=0)
-
-        combined_kv = mx.zeros((B, max_total, kv.shape[-1]), dtype=kv.dtype)
-        combined_gate = mx.zeros((B, max_total, gate.shape[-1]), dtype=gate.dtype)
-        for i, (buf_length, chunk_length, total_length) in enumerate(
-            zip(buf_lengths, chunk_lengths, total_lengths)
-        ):
-            parts_kv = []
-            parts_gate = []
-            if buf_length:
-                parts_kv.append(buf_kv[i : i + 1, :buf_length])
-                parts_gate.append(buf_gate[i : i + 1, :buf_length])
-            if chunk_length:
-                parts_kv.append(kv[i : i + 1, : min(chunk_length, L)])
-                parts_gate.append(gate[i : i + 1, : min(chunk_length, L)])
-            if parts_kv:
-                row_kv = (
-                    parts_kv[0]
-                    if len(parts_kv) == 1
-                    else mx.concatenate(parts_kv, axis=1)
-                )
-                row_gate = (
-                    parts_gate[0]
-                    if len(parts_gate) == 1
-                    else mx.concatenate(parts_gate, axis=1)
-                )
-                combined_kv[i : i + 1, :total_length] = row_kv
-                combined_gate[i : i + 1, :total_length] = row_gate
-
-        ready_kv = combined_kv[:, :max_usable]
-        ready_gate = combined_gate[:, :max_usable]
-        state["buffer_kv"] = mx.zeros((B, max_buffer, kv.shape[-1]), dtype=kv.dtype)
-        state["buffer_gate"] = mx.zeros(
-            (B, max_buffer, gate.shape[-1]), dtype=gate.dtype
-        )
-        for i, (usable, buffer_length) in enumerate(
-            zip(usable_lengths, buffer_lengths)
-        ):
-            if buffer_length:
-                state["buffer_kv"][i : i + 1, :buffer_length] = combined_kv[
-                    i : i + 1, usable : usable + buffer_length
-                ]
-                state["buffer_gate"][i : i + 1, :buffer_length] = combined_gate[
-                    i : i + 1, usable : usable + buffer_length
-                ]
-        state["buffer_lengths"] = buffer_lengths
-        state["_new_pooled_lengths"] = [usable // ratio for usable in usable_lengths]
-
-        prev_lengths = mx.array(buf_lengths, dtype=mx.float32)
-        if isinstance(start_pos, mx.array):
-            pool_base = mx.maximum(start_pos, 0).astype(mx.float32)
-        else:
-            pool_base = mx.full((B,), max(0, start_pos), dtype=mx.float32)
-        return ready_kv, ready_gate, pool_base - prev_lengths
+        buf_x = state["buffer_x"]
+        if buf_x is not None and buf_x.shape[1]:
+            x = mx.concatenate([buf_x, x], axis=1)
+        usable = (x.shape[1] // ratio) * ratio
+        state["buffer_x"] = x[:, usable:]
+        pool_base = max(0, start_pos) - (buf_x.shape[1] if buf_x is not None else 0)
+        return x[:, :usable], pool_base
 
     def update_pool(self, new_pooled: mx.array, state_key: str) -> mx.array:
         state = self._branch_state(state_key)
@@ -1550,16 +1434,25 @@ class Compressor(nn.Module):
         state_key: str = "compressor_state",
     ) -> mx.array:
         B, _, _ = x.shape
-        kv = self.wkv(x)
-        gate = self.wgate(x)
         if cache is None:
+            # Prefill without cache: compute GEMVs for all tokens upfront.
+            kv = self.wkv(x)
+            gate = self.wgate(x)
             usable = (kv.shape[1] // self.compress_ratio) * self.compress_ratio
             ready_kv, ready_gate = kv[:, :usable], gate[:, :usable]
             pool_base = start_pos
         else:
-            ready_kv, ready_gate, pool_base = cache.accumulate_windows(
-                kv, gate, state_key, self.compress_ratio, start_pos
+            # Decode with cache: buffer x and defer wkv/wgate until a full
+            # window is ready, saving (ratio-1)/ratio GEMV calls per step.
+            ready_x, pool_base = cache.accumulate_x_windows(
+                x, state_key, self.compress_ratio, start_pos
             )
+            if ready_x.shape[1] == 0:
+                return cache.update_pool(
+                    mx.zeros((B, 0, self.head_dim), dtype=x.dtype), state_key
+                )
+            ready_kv = self.wkv(ready_x)
+            ready_gate = self.wgate(ready_x)
 
         if ready_kv.shape[1] == 0:
             new_pooled = mx.zeros((B, 0, self.head_dim), dtype=x.dtype)
