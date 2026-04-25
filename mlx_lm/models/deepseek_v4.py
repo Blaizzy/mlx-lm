@@ -1703,48 +1703,22 @@ class V4Attention(nn.Module):
         if self.compress_ratio:
             v4_cache = cache if isinstance(cache, DeepseekV4Cache) else None
             pooled = self.compressor(x, self.compress_rope, v4_cache, offset)
-            lengths = (
-                v4_cache.pooled_lengths("compressor_state")
-                if v4_cache is not None
-                else None
-            )
-            use_indexer = hasattr(self, "indexer") and pooled.shape[1] > 0
-            select_all = (
-                use_indexer
-                and lengths is None
-                and pooled.shape[1] <= self.indexer.index_topk
-            )
-            if select_all:
-                pooled = pooled[:, None]
-                pooled_bias = math.log(L)
-            elif use_indexer:
-                topk = self.indexer(
-                    x, q_residual, self.compress_rope, self.rope, v4_cache, offset
-                )
-                if topk is not None and L > 1:
-                    # Prefill: fused sparse attention gathers compressed KV
-                    # on the fly, avoiding [B, L, topk, D] intermediate.
-                    fused_out = fused_sparse_attention(
-                        q, full_kv, pooled, topk, mask,
-                        self.scale, self.attn_sink.astype(q.dtype),
+            if pooled.shape[1] > 0:
+                if hasattr(self, "indexer") and L > 1:
+                    # Prefill only: run the indexer to get sparse top-k indices.
+                    # For decode (L==1), C <= index_topk always so the indexer
+                    # would select all tokens anyway — skip it and use pooled[:, None].
+                    topk = self.indexer(
+                        x, q_residual, self.compress_rope, self.rope, v4_cache, offset
                     )
-                elif topk is not None:
-                    # Generation (L==1): flatten is safe, use SDPA for speed.
-                    expanded = mx.broadcast_to(
-                        pooled[:, None, :, :],
-                        (B, L, pooled.shape[1], self.head_dim),
-                    )
-                    idx = topk[:, :, :, None]
-                    sel = mx.take_along_axis(
-                        expanded,
-                        mx.broadcast_to(idx, idx.shape[:-1] + (self.head_dim,)),
-                        axis=2,
-                    )
-                    full_kv = mx.concatenate([full_kv, sel], axis=2)
+                    if topk is not None:
+                        fused_out = fused_sparse_attention(
+                            q, full_kv, pooled, topk, mask,
+                            self.scale, self.attn_sink.astype(q.dtype),
+                        )
+                    else:
+                        full_kv = mx.concatenate([full_kv, pooled[:, None]], axis=2)
                 else:
-                    full_kv = mx.concatenate([full_kv, pooled[:, None]], axis=2)
-            else:
-                if pooled.shape[1] > 0:
                     full_kv = mx.concatenate([full_kv, pooled[:, None]], axis=2)
 
         if fused_out is not None:
