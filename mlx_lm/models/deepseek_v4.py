@@ -1812,6 +1812,10 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         self.hc_head = HyperHead(config)
 
     def __call__(self, inputs: mx.array, cache: Optional[Any] = None) -> mx.array:
+        # generate_step adds [None] to the prompt, which can produce (1, 1, L)
+        # when the caller already passes (1, L). Flatten to (B, L).
+        if inputs.ndim != 2:
+            inputs = inputs.reshape(-1, inputs.shape[-1])
         h = self.embed_tokens(inputs)
         h = mx.broadcast_to(
             h[:, :, None, :],
