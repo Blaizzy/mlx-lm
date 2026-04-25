@@ -673,8 +673,14 @@ def _make_fused_sparse_attn_kernel():
     return mx.fast.metal_kernel(
         name="ds4_fused_sparse_attn",
         input_names=[
-            "q", "local_kv", "compressed_kv", "topk_idxs",
-            "local_mask", "attn_sink", "scale_val", "dims",
+            "q",
+            "local_kv",
+            "compressed_kv",
+            "topk_idxs",
+            "local_mask",
+            "attn_sink",
+            "scale_val",
+            "dims",
         ],
         output_names=["out"],
         header="template<typename T> inline void store_elem(device T& dst, float v) { dst = T(v); }",
@@ -683,6 +689,7 @@ def _make_fused_sparse_attn_kernel():
 
 
 _fused_sparse_attn_kernel = _make_fused_sparse_attn_kernel()
+
 
 @mx.compile
 def fused_sparse_attention(
@@ -713,10 +720,17 @@ def fused_sparse_attention(
         )
         idx = topk_idxs[:, :, :, None]
         sparse_kv = mx.take_along_axis(
-            expanded, mx.broadcast_to(idx, idx.shape[:-1] + (D,)), axis=2,
+            expanded,
+            mx.broadcast_to(idx, idx.shape[:-1] + (D,)),
+            axis=2,
         )
         return _split_sparse_attention(
-            q, local_kv, sparse_kv, local_mask, scale, attn_sink,
+            q,
+            local_kv,
+            sparse_kv,
+            local_mask,
+            scale,
+            attn_sink,
         )
 
     # Pad mask if local_kv grew beyond mask width
@@ -741,9 +755,14 @@ def fused_sparse_attention(
 
     return _fused_sparse_attn_kernel(
         inputs=[
-            q, lkv, compressed_kv,
+            q,
+            lkv,
+            compressed_kv,
             topk_idxs.astype(mx.int32),
-            lm, sink, sc, dims,
+            lm,
+            sink,
+            sc,
+            dims,
         ],
         template=[("H", H), ("D", D)],
         grid=(B * L * H * 4, 1, 1),
@@ -1407,12 +1426,12 @@ class Compressor(nn.Module):
 
     def _overlap_transform(self, x: mx.array, fill_value: float):
         B, W, R, _ = x.shape
-        second_half = x[:, :, :, self.head_dim :]                         # (B, W, R, head_dim)
-        fill_row    = mx.full((B, 1, R, self.head_dim), fill_value, dtype=x.dtype)
-        prev_first  = mx.concatenate(
+        second_half = x[:, :, :, self.head_dim :]  # (B, W, R, head_dim)
+        fill_row = mx.full((B, 1, R, self.head_dim), fill_value, dtype=x.dtype)
+        prev_first = mx.concatenate(
             [fill_row, x[:, :-1, :, : self.head_dim]], axis=1
-        )                                                                   # (B, W, R, head_dim)
-        return mx.concatenate([prev_first, second_half], axis=2)           # (B, W, 2R, head_dim)
+        )  # (B, W, R, head_dim)
+        return mx.concatenate([prev_first, second_half], axis=2)  # (B, W, 2R, head_dim)
 
     def __call__(
         self,
@@ -1524,6 +1543,7 @@ class Indexer(nn.Module):
         k = min(self.index_topk, pooled.shape[1])
         return mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
 
+
 @mx.compile
 def _split_sparse_attention(
     q: mx.array,
@@ -1575,7 +1595,9 @@ def _split_sparse_attention(
 
     local_exp = mx.exp(local_scores - m)
     sparse_exp = mx.exp(sparse_scores - m)
-    denom = local_exp.sum(axis=-1, keepdims=True) + sparse_exp.sum(axis=-1, keepdims=True)
+    denom = local_exp.sum(axis=-1, keepdims=True) + sparse_exp.sum(
+        axis=-1, keepdims=True
+    )
     if sinks is not None:
         denom = denom + mx.exp(sink_scores - m)
 
@@ -1729,8 +1751,13 @@ class V4Attention(nn.Module):
                     )
                     if topk is not None:
                         fused_out = fused_sparse_attention(
-                            q, full_kv, pooled, topk, mask,
-                            self.scale, self.attn_sink.astype(q.dtype),
+                            q,
+                            full_kv,
+                            pooled,
+                            topk,
+                            mask,
+                            self.scale,
+                            self.attn_sink.astype(q.dtype),
                         )
                     else:
                         full_kv = mx.concatenate([full_kv, pooled[:, None]], axis=2)
