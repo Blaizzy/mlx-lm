@@ -320,68 +320,75 @@ def _make_hc_split_sinkhorn_kernel():
 
     source = """
         uint idx = thread_position_in_grid.x;
-        constexpr int MIX = (2 + HC) * HC;
+        constexpr int MIX  = (2 + HC) * HC;
         constexpr int BASE = 2 * HC;
 
         const device float* mix = (const device float*)mixes + idx * MIX;
-        device float* pre_out  = (device float*)pre  + idx * HC;
-        device float* post_out = (device float*)post + idx * HC;
-        device float* comb_out = (device float*)comb + idx * HC * HC;
+        device float* pre_out   = (device float*)pre  + idx * HC;
+        device float* post_out  = (device float*)post + idx * HC;
+        device float* comb_out  = (device float*)comb + idx * HC * HC;
 
         const float pre_scale  = scale[0];
         const float post_scale = scale[1];
         const float comb_scale = scale[2];
         const float epsv       = eps[0];
 
-        // Pre-sigmoid: single float4 load + fma + fast sigmoid
+        // Pre-sigmoid
         {
             float4 z = *(const device float4*)mix * pre_scale
                      + *(const device float4*)base;
             *(device float4*)pre_out = 1.0f / (1.0f + metal::fast::exp(-z)) + epsv;
         }
 
-        // Post-sigmoid: single float4 load + fma + fast sigmoid
+        // Post-sigmoid
         {
-            float4 z = *(const device float4*)(mix + 4) * post_scale
-                     + *(const device float4*)(base + 4);
+            float4 z = *(const device float4*)(mix + HC) * post_scale
+                     + *(const device float4*)(base + HC);
             *(device float4*)post_out = 2.0f * 1.0f / (1.0f + metal::fast::exp(-z));
         }
 
-        // Comb: four float4 loads, stable softmax per row, add eps — fully unrolled
+        // Comb: four float4 loads — all independent, GPU issues in parallel
         float4 v0 = *(const device float4*)(mix  + BASE     ) * comb_scale + *(const device float4*)(base + BASE     );
-        float4 v1 = *(const device float4*)(mix  + BASE + 4 ) * comb_scale + *(const device float4*)(base + BASE + 4 );
-        float4 v2 = *(const device float4*)(mix  + BASE + 8 ) * comb_scale + *(const device float4*)(base + BASE + 8 );
+        float4 v1 = *(const device float4*)(mix  + BASE +  4) * comb_scale + *(const device float4*)(base + BASE +  4);
+        float4 v2 = *(const device float4*)(mix  + BASE +  8) * comb_scale + *(const device float4*)(base + BASE +  8);
         float4 v3 = *(const device float4*)(mix  + BASE + 12) * comb_scale + *(const device float4*)(base + BASE + 12);
 
-        float4 e0 = metal::fast::exp(v0 - metal::max(metal::max(v0.x, v0.y), metal::max(v0.z, v0.w)));
-        float4 e1 = metal::fast::exp(v1 - metal::max(metal::max(v1.x, v1.y), metal::max(v1.z, v1.w)));
-        float4 e2 = metal::fast::exp(v2 - metal::max(metal::max(v2.x, v2.y), metal::max(v2.z, v2.w)));
-        float4 e3 = metal::fast::exp(v3 - metal::max(metal::max(v3.x, v3.y), metal::max(v3.z, v3.w)));
+        // Per-row stable softmax: compute all maxes before any exp
+        float m0 = metal::max(metal::max(v0.x, v0.y), metal::max(v0.z, v0.w));
+        float m1 = metal::max(metal::max(v1.x, v1.y), metal::max(v1.z, v1.w));
+        float m2 = metal::max(metal::max(v2.x, v2.y), metal::max(v2.z, v2.w));
+        float m3 = metal::max(metal::max(v3.x, v3.y), metal::max(v3.z, v3.w));
 
-        float4 rows0 = e0 * 1.0f / (dot(e0, float4(1.0f))) + epsv;
-        float4 rows1 = e1 * 1.0f / (dot(e1, float4(1.0f))) + epsv;
-        float4 rows2 = e2 * 1.0f / (dot(e2, float4(1.0f))) + epsv;
-        float4 rows3 = e3 * 1.0f / (dot(e3, float4(1.0f))) + epsv;
+        float4 e0 = metal::fast::exp(v0 - m0);
+        float4 e1 = metal::fast::exp(v1 - m1);
+        float4 e2 = metal::fast::exp(v2 - m2);
+        float4 e3 = metal::fast::exp(v3 - m3);
+
+        // Explicit adds instead of dot(e, 1) — avoids unnecessary fmul
+        float4 r0 = e0 * 1.0f / (e0.x + e0.y + e0.z + e0.w) + epsv;
+        float4 r1 = e1 * 1.0f / (e1.x + e1.y + e1.z + e1.w) + epsv;
+        float4 r2 = e2 * 1.0f / (e2.x + e2.y + e2.z + e2.w) + epsv;
+        float4 r3 = e3 * 1.0f / (e3.x + e3.y + e3.z + e3.w) + epsv;
 
         // Initial column normalization
-        float4 inv_c = 1.0f / (rows0 + rows1 + rows2 + rows3 + epsv);
-        rows0 *= inv_c; rows1 *= inv_c; rows2 *= inv_c; rows3 *= inv_c;
+        float4 col = 1.0f / (r0 + r1 + r2 + r3 + epsv);
+        r0 *= col; r1 *= col; r2 *= col; r3 *= col;
 
-        // Sinkhorn iterations: fully unrolled inner row/col passes
+        // Sinkhorn iterations
         for (int iter = 1; iter < ITERS; ++iter) {
-            rows0 *= 1.0f / (dot(rows0, float4(1.0f)) + epsv);
-            rows1 *= 1.0f / (dot(rows1, float4(1.0f)) + epsv);
-            rows2 *= 1.0f / (dot(rows2, float4(1.0f)) + epsv);
-            rows3 *= 1.0f / (dot(rows3, float4(1.0f)) + epsv);
-            inv_c  = 1.0f / (rows0 + rows1 + rows2 + rows3 + epsv);
-            rows0 *= inv_c; rows1 *= inv_c; rows2 *= inv_c; rows3 *= inv_c;
+            r0 *= 1.0f / (r0.x + r0.y + r0.z + r0.w + epsv);
+            r1 *= 1.0f / (r1.x + r1.y + r1.z + r1.w + epsv);
+            r2 *= 1.0f / (r2.x + r2.y + r2.z + r2.w + epsv);
+            r3 *= 1.0f / (r3.x + r3.y + r3.z + r3.w + epsv);
+            col = 1.0f / (r0 + r1 + r2 + r3 + epsv);
+            r0 *= col; r1 *= col; r2 *= col; r3 *= col;
         }
 
         // Write comb output (four aligned 128-bit stores)
-        *(device float4*)(comb_out)      = rows0;
-        *(device float4*)(comb_out + 4)  = rows1;
-        *(device float4*)(comb_out + 8)  = rows2;
-        *(device float4*)(comb_out + 12) = rows3;
+        *(device float4*)(comb_out)      = r0;
+        *(device float4*)(comb_out +  4) = r1;
+        *(device float4*)(comb_out +  8) = r2;
+        *(device float4*)(comb_out + 12) = r3;
     """
 
     return mx.fast.metal_kernel(
@@ -468,21 +475,20 @@ def _make_hc_sinkhorn_collapse_kernel():
             const float epsv       = eps[0];
 
             if (lane < (uint)HC) {
-                // Pre sigmoid: each lane computes pre[lane]
+                // Pre sigmoid
                 float pre_val = 1.0f / (1.0f + metal::fast::exp(
                     -(mix[lane] * pre_scale + base[lane])
                 )) + epsv;
                 pre_shared[lane] = pre_val;
 
-                // Post sigmoid: each lane computes post[lane]
-                post_out[lane] = 2.0f * (1.0f / (1.0f + metal::fast::exp(
+                // Post sigmoid
+                post_out[lane] = 2.0f * 1.0f / (1.0f + metal::fast::exp(
                     -(mix[HC + lane] * post_scale + base[HC + lane])
-                )));
+                ));
             }
 
             // Comb: each lane in 0..HC-1 owns one row of the HC×HC matrix
-            // Lanes >= HC use zero rows — they participate in simd_sum
-            // but contribute nothing.
+            // Lanes >= HC use zero rows for simd_sum correctness.
             float4 r = float4(0);
             if (lane < (uint)HC) {
                 float4 v = *(const device float4*)(mix + BASE_OFF + lane * HC)
@@ -492,32 +498,30 @@ def _make_hc_sinkhorn_collapse_kernel():
                 float row_max = metal::max(metal::max(v.x, v.y),
                                            metal::max(v.z, v.w));
                 float4 e = metal::fast::exp(v - row_max);
-                float  s = dot(e, float4(1.0f));
-                r = e * (1.0f / s) + epsv;
+                r = e * 1.0f / (e.x + e.y + e.z + e.w) + epsv;
             }
 
             // Initial column normalization (matches original iteration pattern)
             float4 col_sum = float4(
-                simd_sum(r.x) + epsv,
-                simd_sum(r.y) + epsv,
-                simd_sum(r.z) + epsv,
-                simd_sum(r.w) + epsv
+                1.0f / (simd_sum(r.x) + epsv),
+                1.0f / (simd_sum(r.y) + epsv),
+                1.0f / (simd_sum(r.z) + epsv),
+                1.0f / (simd_sum(r.w) + epsv)
             );
-            r /= col_sum;
+            r *= col_sum;
 
             // Remaining sinkhorn iterations: row_norm → col_norm
             for (int iter = 1; iter < ITERS; ++iter) {
                 if (lane < (uint)HC) {
-                    float rsum = dot(r, float4(1.0f)) + epsv;
-                    r *= 1.0f / rsum;
+                    r *= 1.0f / (r.x + r.y + r.z + r.w + epsv);
                 }
                 col_sum = float4(
-                    simd_sum(r.x) + epsv,
-                    simd_sum(r.y) + epsv,
-                    simd_sum(r.z) + epsv,
-                    simd_sum(r.w) + epsv
+                    1.0f / (simd_sum(r.x) + epsv),
+                    1.0f / (simd_sum(r.y) + epsv),
+                    1.0f / (simd_sum(r.z) + epsv),
+                    1.0f / (simd_sum(r.w) + epsv)
                 );
-                r /= col_sum;
+                r *= col_sum;
             }
 
             if (lane < (uint)HC) {
