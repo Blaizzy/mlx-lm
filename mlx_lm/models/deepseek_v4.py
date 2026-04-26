@@ -1696,6 +1696,9 @@ class Model(nn.Module):
             return not (
                 "attn_sink" in k
                 or "e_score_correction_bias" in k
+                or ".attn_hc." in k
+                or ".ffn_hc." in k
+                or ".hc_head." in k
             )
 
         return predicate
