@@ -489,6 +489,24 @@ class HyperConnection(nn.Module):
         return _hc_expand_op(post, block_out, comb, residual)
 
 
+@mx.compile
+def _hyper_head_op(
+    x: mx.array,
+    fn: mx.array,
+    scale: mx.array,
+    base: mx.array,
+    norm_eps: float,
+    hc_eps: float,
+) -> mx.array:
+    """Fused HyperHead: RMS-rsqrt + matmul + sigmoid + weighted sum."""
+    B, L, H, D = x.shape
+    flat = x.reshape(B, L, H * D).astype(mx.float32)
+    rsqrt = mx.rsqrt((flat * flat).mean(axis=-1, keepdims=True) + norm_eps)
+    mixes = (flat @ fn.T) * rsqrt
+    pre = mx.sigmoid(mixes * scale[0] + base) + hc_eps
+    return (pre[..., None] * x.astype(mx.float32)).sum(axis=2).astype(x.dtype)
+
+
 class HyperHead(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
@@ -502,6 +520,10 @@ class HyperHead(nn.Module):
         self.scale = mx.ones((1,), dtype=mx.float32)
 
     def __call__(self, x: mx.array):
+        if not self.training:
+            return _hyper_head_op(
+                x, self.fn, self.scale, self.base, self.norm_eps, self.hc_eps
+            )
         B, L, H, D = x.shape
         flat = x.reshape(B, L, H * D).astype(mx.float32)
         rsqrt = _rms_rsqrt(flat, self.norm_eps)
