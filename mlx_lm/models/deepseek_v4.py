@@ -11,7 +11,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import BatchRotatingKVCache, RotatingKVCache
 from .pipeline import PipelineMixin
-from .switch_layers import SwitchGLU, _gather_sort, _scatter_unsort
+from .switch_layers import SwitchGLU, _scatter_unsort
 
 
 @dataclass
@@ -106,28 +106,33 @@ class LimitedSwiGLU(nn.Module):
 class DeepseekV4SwitchGLU(SwitchGLU):
     sort_threshold = 8
 
-    def __call__(self, x, indices) -> mx.array:
+    def __call__(self, x, indices, scores) -> mx.array:
+        out_shape = x.shape
+        route_shape = indices.shape
         x = mx.expand_dims(x, (-2, -3))
 
         do_sort = indices.size >= self.sort_threshold
-        idx = indices
         inv_order = None
         if do_sort:
-            x, idx, inv_order = _gather_sort(x, indices)
+            flat_indices = indices.flatten()
+            order = mx.argsort(flat_indices)
+            inv_order = mx.argsort(order)
+            x = x.flatten(0, -3)[order // route_shape[-1]]
+            indices = flat_indices[order]
+            scores = scores.flatten()[order]
         if self.training:
-            idx = mx.stop_gradient(idx)
-        x_up = self.up_proj(x, idx, sorted_indices=do_sort)
-        x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
-        x = self.down_proj(
-            self.activation(x_up, x_gate),
-            idx,
-            sorted_indices=do_sort,
-        )
+            indices = mx.stop_gradient(indices)
+        x_up = self.up_proj(x, indices, sorted_indices=do_sort)
+        x_gate = self.gate_proj(x, indices, sorted_indices=do_sort)
+        x = self.activation(x_up, x_gate)
+        x = x * scores.astype(x.dtype)[..., None, None]
+        x = self.down_proj(x, indices, sorted_indices=do_sort)
 
         if do_sort:
-            x = _scatter_unsort(x, inv_order, indices.shape)
+            x = _scatter_unsort(x, inv_order, route_shape)
 
-        return x.squeeze(-2)
+        x = x.squeeze(-2)
+        return x.sum(axis=-2).astype(x.dtype).reshape(out_shape)
 
 
 class DeepseekV4RoPE(nn.Module):
@@ -476,15 +481,14 @@ class HyperConnection(nn.Module):
         self._hc_eps = (mx.array([config.hc_eps], dtype=mx.float32),)
         self.norm_eps = config.rms_norm_eps
         mix = (2 + self.hc_mult) * self.hc_mult
-        self.fn = mx.zeros((mix, self.hc_mult * config.hidden_size))
+        self.fn = mx.zeros((mix, self.hc_mult * config.hidden_size), dtype=mx.float32)
         self.base = mx.zeros((mix,), dtype=mx.float32)
         self.scale = mx.ones((3,), dtype=mx.float32)
 
     def compute_weights(self, x: mx.array):
         B, L, H, D = x.shape
-        flat = x.reshape(B, L, H * D)
-        flat_f32 = flat.astype(mx.float32)
-        rsqrt = _rms_rsqrt(flat_f32, self.norm_eps)
+        flat = x.reshape(B, L, H * D).astype(mx.float32)
+        rsqrt = _rms_rsqrt(flat, self.norm_eps)
         mixes = (flat @ self.fn.T) * rsqrt
         split_sinkhorn = _hc_split_sinkhorn_ops if self.training else hc_split_sinkhorn
         return split_sinkhorn(
@@ -517,16 +521,15 @@ class HyperHead(nn.Module):
         self.norm_eps = config.rms_norm_eps
         self.hc_eps = config.hc_eps
         self.fn = mx.zeros(
-            (self.hc_mult, self.hc_mult * config.hidden_size)
+            (self.hc_mult, self.hc_mult * config.hidden_size), dtype=mx.float32
         )
         self.base = mx.zeros((self.hc_mult,), dtype=mx.float32)
         self.scale = mx.ones((1,), dtype=mx.float32)
 
     def __call__(self, x: mx.array):
         B, L, H, D = x.shape
-        flat = x.reshape(B, L, H * D)
-        flat_f32 = flat.astype(mx.float32)
-        rsqrt = _rms_rsqrt(flat_f32, self.norm_eps)
+        flat = x.reshape(B, L, H * D).astype(mx.float32)
+        rsqrt = _rms_rsqrt(flat, self.norm_eps)
         mixes = (flat @ self.fn.T) * rsqrt
         pre = mx.sigmoid(mixes * self.scale[0] + self.base) + self.hc_eps
         return (pre[..., None] * x.astype(mx.float32)).sum(axis=2).astype(x.dtype)
@@ -618,8 +621,7 @@ class DeepseekV4MoE(nn.Module):
             x = sum_gradients(self.sharding_group)(x)
 
         inds, scores = self.gate(x, input_ids)
-        y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype).reshape(x.shape)
+        y = self.switch_mlp(x, inds, scores)
         y = y + self.shared_experts(x)
 
         if self.sharding_group is not None:
@@ -1535,38 +1537,85 @@ class V4Attention(nn.Module):
         full_kv = kv
         local_kv_len = kv.shape[2]
 
+        pooled_mask = None
+        pooled_bias = None
         if self.compress_ratio:
             v4_cache = cache if isinstance(cache, DeepseekV4Cache) else None
             pooled = self.compressor(x, self.compress_rope, v4_cache, offset)
-            if pooled.shape[1] > 0:
-                if hasattr(self, "indexer") and L > 1:
-                    topk = self.indexer(
-                        x, q_residual, self.compress_rope, self.rope, v4_cache, offset
-                    )
-                    if topk is not None:
-                        expanded = mx.broadcast_to(
-                            pooled[:, None, None, :, :],
-                            (B, 1, L, pooled.shape[1], self.head_dim),
+            lengths = (
+                v4_cache.pooled_lengths("compressor_state")
+                if v4_cache is not None
+                else None
+            )
+            use_indexer = hasattr(self, "indexer") and pooled.shape[1] > 0
+            select_all = (
+                use_indexer
+                and lengths is None
+                and pooled.shape[1] <= self.indexer.index_topk
+            )
+            if select_all:
+                pooled = pooled[:, None]
+                pooled_bias = math.log(L)
+            elif use_indexer:
+                topk = self.indexer(
+                    x, q_residual, self.compress_rope, self.rope, v4_cache, offset
+                )
+                if topk is not None:
+                    if lengths is not None:
+                        lengths = mx.array(lengths)
+                        pooled_mask = (topk < lengths[:, None, None]).reshape(
+                            B, 1, 1, -1
                         )
-                        idx = topk[:, None, :, :, None]
-                        pooled = mx.take_along_axis(
-                            expanded,
-                            mx.broadcast_to(
-                                idx, idx.shape[:-1] + (self.head_dim,)
-                            ),
-                            axis=3,
-                        ).reshape(B, 1, -1, self.head_dim)
-                    else:
-                        pooled = pooled[:, None]
+                    expanded = mx.broadcast_to(
+                        pooled[:, None, None, :, :],
+                        (B, 1, L, pooled.shape[1], self.head_dim),
+                    )
+                    idx = topk[:, None, :, :, None]
+                    pooled = mx.take_along_axis(
+                        expanded,
+                        mx.broadcast_to(idx, idx.shape[:-1] + (self.head_dim,)),
+                        axis=3,
+                    ).reshape(B, 1, -1, self.head_dim)
                 else:
                     pooled = pooled[:, None]
-                full_kv = mx.concatenate([full_kv, pooled], axis=2)
+            else:
+                if lengths is not None:
+                    lengths = mx.array(lengths)
+                    pooled_mask = (
+                        mx.arange(pooled.shape[1]) < lengths[:, None]
+                    ).reshape(B, 1, 1, -1)
+                pooled = pooled[:, None]
+            full_kv = mx.concatenate([full_kv, pooled], axis=2)
+
+        if mask is not None and mask.shape[-1] > local_kv_len:
+            mask = mask[..., -local_kv_len:]
 
         if mask is not None and full_kv.shape[2] > mask.shape[-1]:
-            pad = mx.ones(
-                mask.shape[:-1] + (full_kv.shape[2] - mask.shape[-1],),
-                dtype=mask.dtype,
-            )
+            pad_shape = mask.shape[:-1] + (full_kv.shape[2] - mask.shape[-1],)
+            pad_pooled_mask = pooled_mask
+            if pad_pooled_mask is not None and pad_pooled_mask.shape[-1] != pad_shape[-1]:
+                pad_pooled_mask = pad_pooled_mask[..., -pad_shape[-1] :]
+            if pooled_bias is not None:
+                dtype = q.dtype
+                if mask.dtype == mx.bool_:
+                    mask = mx.where(
+                        mask,
+                        mx.array(0, dtype=dtype),
+                        mx.full((), mx.finfo(dtype).min, dtype=dtype),
+                    )
+                pad = mx.full(pad_shape, pooled_bias, dtype=mask.dtype)
+            elif mask.dtype == mx.bool_:
+                pad = mx.ones(pad_shape, dtype=mask.dtype)
+                if pad_pooled_mask is not None:
+                    pad = pad & pad_pooled_mask
+            else:
+                pad = mx.zeros(pad_shape, dtype=mask.dtype)
+                if pad_pooled_mask is not None:
+                    pad = mx.where(
+                        pad_pooled_mask,
+                        pad,
+                        mx.full(pad_shape, mx.finfo(mask.dtype).min, dtype=mask.dtype),
+                    )
             mask = mx.concatenate([mask, pad], axis=-1)
         out = scaled_dot_product_attention(
             q,
