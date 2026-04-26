@@ -87,6 +87,25 @@ def _score_func(scores: mx.array, func: str) -> mx.array:
 
 
 @mx.compile
+def _expert_select(
+    logits: mx.array,
+    e_score_correction_bias: mx.array,
+    top_k: int,
+    routed_scaling_factor: float,
+    norm_topk_prob: bool,
+    scoring_func: str,
+) -> Tuple[mx.array, mx.array]:
+    scores = _score_func(logits, scoring_func)
+    biased = scores + e_score_correction_bias
+    inds = mx.argpartition(-biased, kth=top_k - 1, axis=-1)[..., :top_k]
+    weights = mx.take_along_axis(scores, inds, axis=-1)
+    if scoring_func != "softmax" and norm_topk_prob:
+        weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
+    weights = weights * routed_scaling_factor
+    return inds, weights
+
+
+@mx.compile
 def _limited_swiglu(gate: mx.array, up: mx.array, limit: float) -> mx.array:
     if limit and limit > 0:
         gate = mx.minimum(gate, limit)
@@ -512,22 +531,26 @@ class MoEGate(nn.Module):
     def __call__(self, x: mx.array, input_ids: Optional[mx.array] = None):
         flat = x.reshape(-1, self.hidden_dim)
         logits = flat.astype(mx.float32) @ self.weight.T.astype(mx.float32)
-        scores = _score_func(logits, self.scoring_func)
 
         if self.hash:
             if input_ids is None:
                 raise ValueError("DeepSeek-V4 hash routing requires input_ids.")
+            scores = _score_func(logits, self.scoring_func)
             inds = self.tid2eid[input_ids.reshape(-1)].astype(mx.int32)
+            weights = mx.take_along_axis(scores, inds, axis=-1)
+            if self.scoring_func != "softmax" and self.norm_topk_prob:
+                weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
+            weights = weights * self.routed_scaling_factor
         else:
-            biased = scores + self.e_score_correction_bias
-            inds = mx.argpartition(-biased, kth=self.top_k - 1, axis=-1)[
-                ..., : self.top_k
-            ]
+            inds, weights = _expert_select(
+                logits,
+                self.e_score_correction_bias,
+                self.top_k,
+                self.routed_scaling_factor,
+                self.norm_topk_prob,
+                self.scoring_func,
+            )
 
-        weights = mx.take_along_axis(scores, inds, axis=-1)
-        if self.scoring_func != "softmax" and self.norm_topk_prob:
-            weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
-        weights = weights * self.routed_scaling_factor
         route_shape = (*x.shape[:-1], self.top_k)
         inds = inds.reshape(route_shape)
         weights = weights.reshape(route_shape)
@@ -1430,50 +1453,51 @@ class V4Attention(nn.Module):
         if self.compress_ratio:
             v4_cache = cache if isinstance(cache, DeepseekV4Cache) else None
             pooled = self.compressor(x, self.compress_rope, v4_cache, offset)
-            lengths = (
-                v4_cache.pooled_lengths("compressor_state")
-                if v4_cache is not None
-                else None
-            )
-            use_indexer = hasattr(self, "indexer") and pooled.shape[1] > 0
-            select_all = (
-                use_indexer
-                and lengths is None
-                and pooled.shape[1] <= self.indexer.index_topk
-            )
-            if select_all:
-                pooled = pooled[:, None]
-                pooled_bias = math.log(L)
-            elif use_indexer:
-                topk = self.indexer(
-                    x, q_residual, self.compress_rope, self.rope, v4_cache, offset
+            if pooled.shape[1] > 0:
+                lengths = (
+                    v4_cache.pooled_lengths("compressor_state")
+                    if v4_cache is not None
+                    else None
                 )
-                if topk is not None:
+                use_indexer = hasattr(self, "indexer")
+                select_all = (
+                    use_indexer
+                    and lengths is None
+                    and pooled.shape[1] <= self.indexer.index_topk
+                )
+                if select_all:
+                    pooled = pooled[:, None]
+                    pooled_bias = math.log(L)
+                elif use_indexer:
+                    topk = self.indexer(
+                        x, q_residual, self.compress_rope, self.rope, v4_cache, offset
+                    )
+                    if topk is not None:
+                        if lengths is not None:
+                            lengths = mx.array(lengths)
+                            pooled_mask = (topk < lengths[:, None, None]).reshape(
+                                B, 1, 1, -1
+                            )
+                        expanded = mx.broadcast_to(
+                            pooled[:, None, None, :, :],
+                            (B, 1, L, pooled.shape[1], self.head_dim),
+                        )
+                        idx = topk[:, None, :, :, None]
+                        pooled = mx.take_along_axis(
+                            expanded,
+                            mx.broadcast_to(idx, idx.shape[:-1] + (self.head_dim,)),
+                            axis=3,
+                        ).reshape(B, 1, -1, self.head_dim)
+                    else:
+                        pooled = pooled[:, None]
+                else:
                     if lengths is not None:
                         lengths = mx.array(lengths)
-                        pooled_mask = (topk < lengths[:, None, None]).reshape(
-                            B, 1, 1, -1
-                        )
-                    expanded = mx.broadcast_to(
-                        pooled[:, None, None, :, :],
-                        (B, 1, L, pooled.shape[1], self.head_dim),
-                    )
-                    idx = topk[:, None, :, :, None]
-                    pooled = mx.take_along_axis(
-                        expanded,
-                        mx.broadcast_to(idx, idx.shape[:-1] + (self.head_dim,)),
-                        axis=3,
-                    ).reshape(B, 1, -1, self.head_dim)
-                else:
+                        pooled_mask = (
+                            mx.arange(pooled.shape[1]) < lengths[:, None]
+                        ).reshape(B, 1, 1, -1)
                     pooled = pooled[:, None]
-            else:
-                if lengths is not None:
-                    lengths = mx.array(lengths)
-                    pooled_mask = (
-                        mx.arange(pooled.shape[1]) < lengths[:, None]
-                    ).reshape(B, 1, 1, -1)
-                pooled = pooled[:, None]
-            full_kv = mx.concatenate([full_kv, pooled], axis=2)
+                full_kv = mx.concatenate([full_kv, pooled], axis=2)
 
         if mask is not None and mask.shape[-1] > local_kv_len:
             mask = mask[..., -local_kv_len:]
