@@ -341,77 +341,67 @@ def _make_hc_split_sinkhorn_kernel():
     source = """
         uint idx = thread_position_in_grid.x;
         constexpr int MIX = (2 + HC) * HC;
-        float epsv = static_cast<float>(eps[0]);
+        constexpr int BASE = 2 * HC;
 
-        const auto mix = mixes + idx * MIX;
-        auto pre_out   = pre   + idx * HC;
-        auto post_out  = post  + idx * HC;
-        auto comb_out  = comb  + idx * HC * HC;
+        const device float* mix = (const device float*)mixes + idx * MIX;
+        device float* pre_out  = (device float*)pre  + idx * HC;
+        device float* post_out = (device float*)post + idx * HC;
+        device float* comb_out = (device float*)comb + idx * HC * HC;
 
-        const float pre_scale  = static_cast<float>(scale[0]);
-        const float post_scale = static_cast<float>(scale[1]);
-        const float comb_scale = static_cast<float>(scale[2]);
+        const float pre_scale  = scale[0];
+        const float post_scale = scale[1];
+        const float comb_scale = scale[2];
+        const float epsv       = eps[0];
 
-        // Pre-sigmoid: float4 vectorized (HC == 4)
+        // Pre-sigmoid: single float4 load + fma + fast sigmoid
         {
-            float4 z = float4(
-                static_cast<float>(mix[0]), static_cast<float>(mix[1]),
-                static_cast<float>(mix[2]), static_cast<float>(mix[3])
-            ) * pre_scale + float4(
-                static_cast<float>(base[0]), static_cast<float>(base[1]),
-                static_cast<float>(base[2]), static_cast<float>(base[3])
-            );
+            float4 z = *(const device float4*)mix * pre_scale
+                     + *(const device float4*)base;
             *(device float4*)pre_out = 1.0f / (1.0f + metal::fast::exp(-z)) + epsv;
         }
 
-        // Post-sigmoid: float4 vectorized
+        // Post-sigmoid: single float4 load + fma + fast sigmoid
         {
-            float4 z = float4(
-                static_cast<float>(mix[4]), static_cast<float>(mix[5]),
-                static_cast<float>(mix[6]), static_cast<float>(mix[7])
-            ) * post_scale + float4(
-                static_cast<float>(base[4]), static_cast<float>(base[5]),
-                static_cast<float>(base[6]), static_cast<float>(base[7])
-            );
-            *(device float4*)post_out = 2.0f / (1.0f + metal::fast::exp(-z));
+            float4 z = *(const device float4*)(mix + 4) * post_scale
+                     + *(const device float4*)(base + 4);
+            *(device float4*)post_out = 2.0f * 1.0f / (1.0f + metal::fast::exp(-z));
         }
 
-        // Comb: 4x4 matrix as float4 rows; tree-reduce max, vectorized exp + dot-product sum
-        constexpr int BASE = 2 * HC;
-        float4 rows[4];
-        for (int i = 0; i < 4; ++i) {
-            float4 v = float4(
-                fma(static_cast<float>(mix[BASE + i*HC + 0]), comb_scale, static_cast<float>(base[BASE + i*HC + 0])),
-                fma(static_cast<float>(mix[BASE + i*HC + 1]), comb_scale, static_cast<float>(base[BASE + i*HC + 1])),
-                fma(static_cast<float>(mix[BASE + i*HC + 2]), comb_scale, static_cast<float>(base[BASE + i*HC + 2])),
-                fma(static_cast<float>(mix[BASE + i*HC + 3]), comb_scale, static_cast<float>(base[BASE + i*HC + 3]))
-            );
-            float m = metal::max(metal::max(v.x, v.y), metal::max(v.z, v.w));
-            float4 e = metal::fast::exp(v - m);
-            rows[i] = e * 1.0f /(dot(e, float4(1.0f))) + epsv;
-        }
+        // Comb: four float4 loads, stable softmax per row, add eps — fully unrolled
+        float4 v0 = *(const device float4*)(mix  + BASE     ) * comb_scale + *(const device float4*)(base + BASE     );
+        float4 v1 = *(const device float4*)(mix  + BASE + 4 ) * comb_scale + *(const device float4*)(base + BASE + 4 );
+        float4 v2 = *(const device float4*)(mix  + BASE + 8 ) * comb_scale + *(const device float4*)(base + BASE + 8 );
+        float4 v3 = *(const device float4*)(mix  + BASE + 12) * comb_scale + *(const device float4*)(base + BASE + 12);
+
+        float4 e0 = metal::fast::exp(v0 - metal::max(metal::max(v0.x, v0.y), metal::max(v0.z, v0.w)));
+        float4 e1 = metal::fast::exp(v1 - metal::max(metal::max(v1.x, v1.y), metal::max(v1.z, v1.w)));
+        float4 e2 = metal::fast::exp(v2 - metal::max(metal::max(v2.x, v2.y), metal::max(v2.z, v2.w)));
+        float4 e3 = metal::fast::exp(v3 - metal::max(metal::max(v3.x, v3.y), metal::max(v3.z, v3.w)));
+
+        float4 rows0 = e0 * 1.0f / (dot(e0, float4(1.0f))) + epsv;
+        float4 rows1 = e1 * 1.0f / (dot(e1, float4(1.0f))) + epsv;
+        float4 rows2 = e2 * 1.0f / (dot(e2, float4(1.0f))) + epsv;
+        float4 rows3 = e3 * 1.0f / (dot(e3, float4(1.0f))) + epsv;
 
         // Initial column normalization
-        {
-            float4 inv_c = 1.0f /(rows[0] + rows[1] + rows[2] + rows[3] + epsv);
-            rows[0] *= inv_c; rows[1] *= inv_c;
-            rows[2] *= inv_c; rows[3] *= inv_c;
-        }
+        float4 inv_c = 1.0f / (rows0 + rows1 + rows2 + rows3 + epsv);
+        rows0 *= inv_c; rows1 *= inv_c; rows2 *= inv_c; rows3 *= inv_c;
 
-        // Sinkhorn iterations: row-normalize then column-normalize
+        // Sinkhorn iterations: fully unrolled inner row/col passes
         for (int iter = 1; iter < ITERS; ++iter) {
-            for (int i = 0; i < 4; ++i)
-                rows[i] *= 1.0f /(dot(rows[i], float4(1.0f)) + epsv);
-            float4 inv_c = 1.0f /(rows[0] + rows[1] + rows[2] + rows[3] + epsv);
-            rows[0] *= inv_c; rows[1] *= inv_c;
-            rows[2] *= inv_c; rows[3] *= inv_c;
+            rows0 *= 1.0f / (dot(rows0, float4(1.0f)) + epsv);
+            rows1 *= 1.0f / (dot(rows1, float4(1.0f)) + epsv);
+            rows2 *= 1.0f / (dot(rows2, float4(1.0f)) + epsv);
+            rows3 *= 1.0f / (dot(rows3, float4(1.0f)) + epsv);
+            inv_c  = 1.0f / (rows0 + rows1 + rows2 + rows3 + epsv);
+            rows0 *= inv_c; rows1 *= inv_c; rows2 *= inv_c; rows3 *= inv_c;
         }
 
         // Write comb output (four aligned 128-bit stores)
-        *(device float4*)(comb_out)      = rows[0];
-        *(device float4*)(comb_out + 4)  = rows[1];
-        *(device float4*)(comb_out + 8)  = rows[2];
-        *(device float4*)(comb_out + 12) = rows[3];
+        *(device float4*)(comb_out)      = rows0;
+        *(device float4*)(comb_out + 4)  = rows1;
+        *(device float4*)(comb_out + 8)  = rows2;
+        *(device float4*)(comb_out + 12) = rows3;
     """
 
     return mx.fast.metal_kernel(
