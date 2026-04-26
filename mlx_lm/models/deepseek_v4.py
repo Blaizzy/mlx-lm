@@ -1535,7 +1535,6 @@ class V4Attention(nn.Module):
         full_kv = kv
         local_kv_len = kv.shape[2]
 
-        sparse_out = None
         if self.compress_ratio:
             v4_cache = cache if isinstance(cache, DeepseekV4Cache) else None
             pooled = self.compressor(x, self.compress_rope, v4_cache, offset)
@@ -1545,43 +1544,39 @@ class V4Attention(nn.Module):
                         x, q_residual, self.compress_rope, self.rope, v4_cache, offset
                     )
                     if topk is not None:
-                        B, C, D = pooled.shape[0], pooled.shape[1], pooled.shape[2]
                         expanded = mx.broadcast_to(
-                            pooled[:, None, :, :], (B, L, C, D)
+                            pooled[:, None, None, :, :],
+                            (B, 1, L, pooled.shape[1], self.head_dim),
                         )
-                        idx = topk[:, :, :, None]
-                        sparse_kv = mx.take_along_axis(
+                        idx = topk[:, None, :, :, None]
+                        pooled = mx.take_along_axis(
                             expanded,
-                            mx.broadcast_to(idx, idx.shape[:-1] + (D,)),
-                            axis=2,
-                        )
-                        sparse_out = _split_sparse_attention(
-                            q, full_kv, sparse_kv, mask,
-                            self.scale, self.attn_sink.astype(q.dtype),
-                        )
+                            mx.broadcast_to(
+                                idx, idx.shape[:-1] + (self.head_dim,)
+                            ),
+                            axis=3,
+                        ).reshape(B, 1, -1, self.head_dim)
                     else:
-                        full_kv = mx.concatenate([full_kv, pooled[:, None]], axis=2)
+                        pooled = pooled[:, None]
                 else:
-                    full_kv = mx.concatenate([full_kv, pooled[:, None]], axis=2)
+                    pooled = pooled[:, None]
+                full_kv = mx.concatenate([full_kv, pooled], axis=2)
 
-        if sparse_out is not None:
-            out = sparse_out
-        else:
-            if mask is not None and full_kv.shape[2] > mask.shape[-1]:
-                pad = mx.ones(
-                    mask.shape[:-1] + (full_kv.shape[2] - mask.shape[-1],),
-                    dtype=mask.dtype,
-                )
-                mask = mx.concatenate([mask, pad], axis=-1)
-            out = scaled_dot_product_attention(
-                q,
-                full_kv,
-                full_kv,
-                cache=local_cache,
-                scale=self.scale,
-                mask=mask,
-                sinks=self.attn_sink.astype(q.dtype),
+        if mask is not None and full_kv.shape[2] > mask.shape[-1]:
+            pad = mx.ones(
+                mask.shape[:-1] + (full_kv.shape[2] - mask.shape[-1],),
+                dtype=mask.dtype,
             )
+            mask = mx.concatenate([mask, pad], axis=-1)
+        out = scaled_dot_product_attention(
+            q,
+            full_kv,
+            full_kv,
+            cache=local_cache,
+            scale=self.scale,
+            mask=mask,
+            sinks=self.attn_sink.astype(q.dtype),
+        )
         out = _apply_partial_rope(out, self.rope, offset, inverse=True)
         out = out.transpose(0, 2, 1, 3).reshape(B, L, self.n_heads * self.head_dim)
         out = self._grouped_output_projection(out)
