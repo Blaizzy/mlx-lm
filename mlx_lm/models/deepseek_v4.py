@@ -543,6 +543,7 @@ class MoEGate(nn.Module):
         self.routed_scaling_factor = config.routed_scaling_factor
         self.norm_topk_prob = config.norm_topk_prob
         self.weight = mx.zeros((self.num_experts, self.hidden_dim))
+        self._weight_T_f32 = None
         if self.hash:
             self.tid2eid = mx.zeros((config.vocab_size, self.top_k), dtype=mx.int32)
         else:
@@ -552,7 +553,9 @@ class MoEGate(nn.Module):
 
     def __call__(self, x: mx.array, input_ids: Optional[mx.array] = None):
         flat = x.reshape(-1, self.hidden_dim)
-        logits = flat.astype(mx.float32) @ self.weight.T.astype(mx.float32)
+        if self._weight_T_f32 is None:
+            self._weight_T_f32 = self.weight.T.astype(mx.float32)
+        logits = flat.astype(mx.float32) @ self._weight_T_f32
 
         if self.hash:
             if input_ids is None:
@@ -1378,6 +1381,7 @@ class V4Attention(nn.Module):
         )
         self.attn_sink = mx.zeros((self.n_heads,), dtype=mx.float32)
         self._q_l2_norm_weight = (mx.ones((self.head_dim,)),)
+        self._cached_dtype = None
 
         rope_theta = (
             config.compress_rope_theta if self.compress_ratio else config.rope_theta
@@ -1395,6 +1399,32 @@ class V4Attention(nn.Module):
             if self.compress_ratio == 4:
                 self.indexer = Indexer(config, self.compress_ratio)
 
+    def _ensure_cached(self, dtype):
+        if self._cached_dtype == dtype:
+            return
+        self._cached_dtype = dtype
+        self._attn_sink_cached = self.attn_sink.astype(dtype)
+        self._q_norm_weight_cached = self._q_l2_norm_weight[0].astype(dtype)
+        if isinstance(self.wo_a, nn.QuantizedLinear):
+            self._wo_a_weight = self.wo_a.weight.reshape(
+                self.o_groups, self.o_lora_rank, -1
+            )[:, None]
+            self._wo_a_scales = self.wo_a.scales.reshape(
+                self.o_groups, self.o_lora_rank, -1
+            )[:, None]
+            self._wo_a_biases = (
+                None
+                if self.wo_a.biases is None
+                else self.wo_a.biases.reshape(
+                    self.o_groups, self.o_lora_rank, -1
+                )[:, None]
+            )
+        else:
+            group_feat = (self.n_heads * self.head_dim) // self.o_groups
+            self._wo_a_weight_reshaped = self.wo_a.weight.reshape(
+                self.o_groups, self.o_lora_rank, group_feat
+            )
+
     def _grouped_output_projection(self, out: mx.array) -> mx.array:
         B, L = out.shape[:2]
         group_feat = (self.n_heads * self.head_dim) // self.o_groups
@@ -1402,24 +1432,11 @@ class V4Attention(nn.Module):
 
         if isinstance(self.wo_a, nn.QuantizedLinear):
             out = out.transpose(2, 0, 1, 3)
-            weight = self.wo_a.weight.reshape(self.o_groups, self.o_lora_rank, -1)[
-                :, None
-            ]
-            scales = self.wo_a.scales.reshape(self.o_groups, self.o_lora_rank, -1)[
-                :, None
-            ]
-            biases = (
-                None
-                if self.wo_a.biases is None
-                else self.wo_a.biases.reshape(self.o_groups, self.o_lora_rank, -1)[
-                    :, None
-                ]
-            )
             out = mx.quantized_matmul(
                 out,
-                weight,
-                scales=scales,
-                biases=biases,
+                self._wo_a_weight,
+                scales=self._wo_a_scales,
+                biases=self._wo_a_biases,
                 transpose=True,
                 group_size=self.wo_a.group_size,
                 bits=self.wo_a.bits,
@@ -1432,8 +1449,7 @@ class V4Attention(nn.Module):
                 out = out + self.wo_a.bias
             return out
 
-        weight = self.wo_a.weight.reshape(self.o_groups, self.o_lora_rank, group_feat)
-        out = mx.einsum("bsgd,grd->bsgr", out, weight)
+        out = mx.einsum("bsgd,grd->bsgr", out, self._wo_a_weight_reshaped)
         out = out.reshape(B, L, self.o_groups * self.o_lora_rank)
         if "bias" in self.wo_a:
             out = out + self.wo_a.bias
@@ -1455,8 +1471,9 @@ class V4Attention(nn.Module):
             offset = offset + 0
         q_residual = self.q_norm(self.wq_a(x))
         q = self.wq_b(q_residual).reshape(B, L, self.n_heads, self.head_dim)
+        self._ensure_cached(q.dtype)
         q = mx.fast.rms_norm(
-            q, self._q_l2_norm_weight[0].astype(q.dtype), self.config.rms_norm_eps
+            q, self._q_norm_weight_cached, self.config.rms_norm_eps
         )
         q = q.transpose(0, 2, 1, 3)
         kv = self.kv_norm(self.wkv(x)).reshape(B, L, 1, self.head_dim)
@@ -1558,7 +1575,7 @@ class V4Attention(nn.Module):
             cache=local_cache,
             scale=self.scale,
             mask=mask,
-            sinks=self.attn_sink.astype(q.dtype),
+            sinks=self._attn_sink_cached,
         )
         out = _apply_partial_rope(out, self.rope, offset, inverse=True)
         out = out.transpose(0, 2, 1, 3).reshape(B, L, self.n_heads * self.head_dim)
