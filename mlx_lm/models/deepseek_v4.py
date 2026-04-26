@@ -244,50 +244,6 @@ def _rope_full(
     return pe_out
 
 
-def _make_q_norm_kernel():
-    """Per-head RMS norm for query vectors: fuses sq-accumulate + rsqrt + scale in one pass."""
-    if mx.default_device() != mx.gpu or not mx.metal.is_available():
-        return None
-
-    source = """
-        uint tid = thread_position_in_threadgroup.x;  // 0..31 (one SIMD group)
-        uint gid = threadgroup_position_in_grid.x;    // one per (b, l, h) triplet
-
-        int D   = dims[0];
-        int L_v = dims[1];
-        int H_v = dims[2];
-        float eps_v = float(eps[0]);
-
-        uint h   = gid % (uint)H_v;
-        uint tmp = gid / (uint)H_v;
-        uint l   = tmp % (uint)L_v;
-        uint b   = tmp / (uint)L_v;
-
-        const auto xp = x + ((uint64_t)b * L_v * H_v + l * H_v + h) * D;
-        auto       yp = y + ((uint64_t)b * L_v * H_v + l * H_v + h) * D;
-
-        // Pass 1: accumulate partial sum of squares (stride-32 coalesced)
-        float partial_sq = 0.f;
-        for (int i = (int)tid; i < D; i += 32)
-            partial_sq = fma(float(xp[i]), float(xp[i]), partial_sq);
-
-        float rms_scale = metal::fast::rsqrt(simd_sum(partial_sq) / float(D) + eps_v);
-
-        // Pass 2: apply scale (D=512 fits in L1 cache; second pass is cache-warm)
-        for (int i = (int)tid; i < D; i += 32)
-            store_elem(yp[i], float(xp[i]) * rms_scale);
-    """
-    return mx.fast.metal_kernel(
-        name="ds4_q_norm",
-        input_names=["x", "eps", "dims"],
-        output_names=["y"],
-        header="template<typename T> inline void store_elem(device T& dst, float v) { dst = T(v); }",
-        source=source,
-    )
-
-
-_q_norm_kernel = _make_q_norm_kernel()
-
 
 def _apply_partial_rope(
     x: mx.array,
@@ -1341,74 +1297,6 @@ class Indexer(nn.Module):
         k = min(self.index_topk, pooled.shape[1])
         return mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
 
-
-@mx.compile
-def _split_sparse_attention(
-    q: mx.array,
-    local_kv: mx.array,
-    sparse_kv: mx.array,
-    local_mask: Optional[mx.array],
-    scale: float,
-    sinks: Optional[mx.array],
-) -> mx.array:
-    """Compute attention over local sliding-window KV and per-query sparse KV.
-
-    Avoids materializing [B, H, L, T_local + L*topk] attention scores by
-    computing local and sparse attention separately and combining via
-    log-sum-exp. Each query position attends only to its own top-k compressed
-    keys, not keys selected by other positions.
-
-    Args:
-        q: [B, H, L, D] queries.
-        local_kv: [B, 1, T_local, D] shared local KV (GQA head dim broadcasts).
-        sparse_kv: [B, L, topk, D] per-query-position selected compressed KV.
-        local_mask: [B, 1, L, T_local] additive mask for local attention or None.
-        scale: attention scale factor.
-        sinks: [H] per-head attention sink bias or None. Adds a virtual token
-            with this score and zero value to the softmax denominator.
-    """
-    q_f = q.astype(mx.float32)
-
-    # Local scores: [B, H, L, T_local]
-    local_scores = (q_f @ local_kv.astype(mx.float32).swapaxes(-1, -2)) * scale
-    if local_mask is not None:
-        local_scores = local_scores + local_mask
-
-    # Sparse scores: [B, H, L, topk]
-    # [B, H, L, 1, D] @ [B, 1, L, D, topk] -> [B, H, L, 1, topk] -> squeeze
-    sparse_kv_f = sparse_kv.astype(mx.float32)
-    sparse_scores = (
-        q_f[:, :, :, None, :] @ sparse_kv_f[:, None].swapaxes(-1, -2)
-    ).squeeze(3) * scale
-
-    # Combined softmax via log-sum-exp
-    local_max = local_scores.max(axis=-1, keepdims=True)
-    sparse_max = sparse_scores.max(axis=-1, keepdims=True)
-    m = mx.maximum(local_max, sparse_max)
-
-    # Attention sinks: virtual token with score=sink[h], value=0
-    if sinks is not None:
-        sink_scores = sinks[None, :, None, None].astype(mx.float32)
-        m = mx.maximum(m, sink_scores)
-
-    local_exp = mx.exp(local_scores - m)
-    sparse_exp = mx.exp(sparse_scores - m)
-    denom = local_exp.sum(axis=-1, keepdims=True) + sparse_exp.sum(
-        axis=-1, keepdims=True
-    )
-    if sinks is not None:
-        denom = denom + mx.exp(sink_scores - m)
-
-    inv_denom = mx.reciprocal(denom)
-
-    # Local values: [B, H, L, T_local] @ [B, 1, T_local, D] -> [B, H, L, D]
-    out = (local_exp * inv_denom) @ local_kv.astype(mx.float32)
-    # Sparse values: [B, H, L, 1, topk] @ [B, 1, L, topk, D] -> [B, H, L, 1, D]
-    out = out + (
-        (sparse_exp * inv_denom)[:, :, :, None, :] @ sparse_kv_f[:, None]
-    ).squeeze(3)
-
-    return out.astype(q.dtype)
 
 
 class V4Attention(nn.Module):
