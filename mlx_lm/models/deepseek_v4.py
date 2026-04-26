@@ -445,6 +445,11 @@ def _rms_rsqrt(flat: mx.array, eps: float) -> mx.array:
     return mx.rsqrt((flat * flat).mean(axis=-1, keepdims=True) + eps)
 
 
+@mx.compile
+def _hc_mixes(flat: mx.array, fn_T: mx.array, norm_eps: float) -> mx.array:
+    """Fused RMS-rsqrt + matmul + scale into single compiled graph."""
+    rsqrt = mx.rsqrt((flat * flat).mean(axis=-1, keepdims=True) + norm_eps)
+    return (flat @ fn_T) * rsqrt
 
 
 class HyperConnection(nn.Module):
@@ -459,12 +464,18 @@ class HyperConnection(nn.Module):
         self.fn = mx.zeros((mix, self.hc_mult * config.hidden_size), dtype=mx.float32)
         self.base = mx.zeros((mix,), dtype=mx.float32)
         self.scale = mx.ones((3,), dtype=mx.float32)
+        self._fn_T = None
 
     def compute_weights(self, x: mx.array):
         B, L, H, D = x.shape
         flat = x.reshape(B, L, H * D).astype(mx.float32)
-        rsqrt = _rms_rsqrt(flat, self.norm_eps)
-        mixes = (flat @ self.fn.T) * rsqrt
+        if self._fn_T is None:
+            self._fn_T = self.fn.T
+        if self.training:
+            rsqrt = _rms_rsqrt(flat, self.norm_eps)
+            mixes = (flat @ self._fn_T) * rsqrt
+        else:
+            mixes = _hc_mixes(flat, self._fn_T, self.norm_eps)
         split_sinkhorn = _hc_split_sinkhorn_ops if self.training else hc_split_sinkhorn
         return split_sinkhorn(
             mixes,
