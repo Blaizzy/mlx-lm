@@ -438,13 +438,14 @@ def _hc_collapse_op(pre: mx.array, x: mx.array) -> mx.array:
 def _make_hc_sinkhorn_collapse_kernel():
     """Fused sinkhorn + collapse: eliminates one dispatch per HC cycle.
 
-    Key optimizations over the naive version:
-    1. PARALLEL SINKHORN: threads 0-3 each own one HC row of comb.
-       Column normalization uses simd_sum() — free on Apple GPU.
-    2. SIMD BROADCAST for pre: no threadgroup write needed for pre.
-    3. VECTORIZED COLLAPSE: float4 loads (4 bfloat16 → float at once).
-    4. THREAD LAYOUT: first simd group (lanes 0-31) handles sinkhorn
-       in parallel; all 256 threads handle collapse.
+    1. BRANCHLESS SINKHORN: all 32 lanes in simd group 0 execute identical
+       instructions. Lanes >= HC use multiplicative mask (active=0) instead
+       of divergent branches — eliminates SIMD serialization.
+    2. PARALLEL SINKHORN: lanes 0-3 each own one comb row. Column norm
+       via simd_sum() — free SIMD shuffle.
+    3. NATIVE bfloat4 LOADS: single 64-bit load yields 4 bfloat16 values;
+       cast to float4 is a free hardware conversion.
+    4. FMA CHAINS: collapse uses fused multiply-add for 3 of 4 terms.
     """
     if mx.default_device() != mx.gpu or not mx.metal.is_available():
         return None
@@ -458,15 +459,17 @@ def _make_hc_sinkhorn_collapse_kernel():
         constexpr int MIX      = (2 + HC) * HC;
         constexpr int BASE_OFF = 2 * HC;
 
-        const device float* mix  = (const device float*)mixes + row * MIX;
+        const device float* mix      = (const device float*)mixes + row * MIX;
         device float*       post_out = (device float*)post + row * HC;
         device float*       comb_out = (device float*)comb + row * HC * HC;
 
         threadgroup float pre_shared[HC];
 
         // ================================================================
-        // PHASE 1: Sinkhorn — first simd group, lanes 0-3 do real work,
-        //          lanes 4-31 participate with zero for simd_sum correctness
+        // PHASE 1: Branchless sinkhorn on simd group 0
+        //   All 32 lanes execute identical instructions. Lanes >= HC
+        //   compute on clamped indices but multiply by active=0, so they
+        //   contribute zero to simd_sum. No divergent branches in the loop.
         // ================================================================
         if (sg == 0) {
             const float pre_scale  = scale[0];
@@ -474,54 +477,51 @@ def _make_hc_sinkhorn_collapse_kernel():
             const float comb_scale = scale[2];
             const float epsv       = eps[0];
 
-            if (lane < (uint)HC) {
-                // Pre sigmoid
-                float pre_val = 1.0f / (1.0f + metal::fast::exp(
-                    -(mix[lane] * pre_scale + base[lane])
-                )) + epsv;
-                pre_shared[lane] = pre_val;
+            const float active = (lane < (uint)HC) ? 1.0f : 0.0f;
+            const uint  llane  = metal::min(lane, (uint)(HC - 1));
 
-                // Post sigmoid
-                post_out[lane] = 2.0f * 1.0f / (1.0f + metal::fast::exp(
-                    -(mix[HC + lane] * post_scale + base[HC + lane])
-                ));
+            // Pre/post sigmoids: all lanes compute, only active lanes write
+            float pre_z  = mix[llane]      * pre_scale  + base[llane];
+            float post_z = mix[HC + llane] * post_scale + base[HC + llane];
+            float pre_v  = 1.0f / (1.0f + metal::fast::exp(-pre_z)) + epsv;
+            float post_v = 2.0f / (1.0f + metal::fast::exp(-post_z));
+
+            if (lane < (uint)HC) {
+                pre_shared[lane] = pre_v;
+                post_out[lane]   = post_v;
             }
 
-            // Comb: each lane in 0..HC-1 owns one row of the HC×HC matrix
-            // Lanes >= HC use zero rows for simd_sum correctness.
-            float4 r = float4(0);
-            if (lane < (uint)HC) {
-                float4 v = *(const device float4*)(mix + BASE_OFF + lane * HC)
-                             * comb_scale
-                         + *(const device float4*)(base + BASE_OFF + lane * HC);
+            // Comb softmax: load + mask. Inactive lanes load row 0 (safe)
+            // but multiply by active=0 so they hold zeros.
+            float4 v = (*(const device float4*)(mix  + BASE_OFF + llane * HC)
+                            * comb_scale
+                      + *(const device float4*)(base + BASE_OFF + llane * HC))
+                     * active;
 
-                float row_max = metal::max(metal::max(v.x, v.y),
-                                           metal::max(v.z, v.w));
-                float4 e = metal::fast::exp(v - row_max);
-                r = e * 1.0f / (e.x + e.y + e.z + e.w) + epsv;
-            }
+            float row_max = metal::max(metal::max(v.x, v.y),
+                                       metal::max(v.z, v.w));
+            float4 e = metal::fast::exp(v - row_max) * active;
+            float4 r = e * (1.0f / (e.x + e.y + e.z + e.w + epsv))
+                     + epsv * active;
 
-            // Initial column normalization (matches original iteration pattern)
-            float4 col_sum = float4(
-                1.0f / (simd_sum(r.x) + epsv),
-                1.0f / (simd_sum(r.y) + epsv),
-                1.0f / (simd_sum(r.z) + epsv),
-                1.0f / (simd_sum(r.w) + epsv)
-            );
-            r *= col_sum;
+            // Initial column normalization
+            float4 col_inv = 1.0f / (float4(
+                simd_sum(r.x), simd_sum(r.y),
+                simd_sum(r.z), simd_sum(r.w)
+            ) + epsv);
+            r *= col_inv;
 
-            // Remaining sinkhorn iterations: row_norm → col_norm
+            // Sinkhorn iterations: zero branches in the loop body
             for (int iter = 1; iter < ITERS; ++iter) {
-                if (lane < (uint)HC) {
-                    r *= 1.0f / (r.x + r.y + r.z + r.w + epsv);
-                }
-                col_sum = float4(
-                    1.0f / (simd_sum(r.x) + epsv),
-                    1.0f / (simd_sum(r.y) + epsv),
-                    1.0f / (simd_sum(r.z) + epsv),
-                    1.0f / (simd_sum(r.w) + epsv)
-                );
-                r *= col_sum;
+                // Row norm + re-clamp inactive lanes
+                r *= (1.0f / (r.x + r.y + r.z + r.w + epsv)) * active;
+
+                // Col norm via simd_sum
+                col_inv = 1.0f / (float4(
+                    simd_sum(r.x), simd_sum(r.y),
+                    simd_sum(r.z), simd_sum(r.w)
+                ) + epsv);
+                r *= col_inv;
             }
 
             if (lane < (uint)HC) {
@@ -529,11 +529,10 @@ def _make_hc_sinkhorn_collapse_kernel():
             }
         }
 
-        // All 256 threads sync for pre_shared
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // ================================================================
-        // PHASE 2: Collapse — all 256 threads, float4-vectorized over D
+        // PHASE 2: Collapse — all 256 threads, native bfloat4 vectorized
         // ================================================================
         const float p0 = pre_shared[0];
         const float p1 = pre_shared[1];
@@ -545,38 +544,37 @@ def _make_hc_sinkhorn_collapse_kernel():
         device bfloat16_t*       out_row = (device bfloat16_t*)collapsed
                                          + row * D;
 
-        // Vectorized: 4 elements per iteration
-        uint d_base = tid * 4;
-        uint stride = 256 * 4;
+        // Native bfloat4 pointers: single 64-bit load per vector
+        using bf4 = vec<bfloat16_t, 4>;
+        const device bf4* x_row0 = (const device bf4*)(x_row + 0*D);
+        const device bf4* x_row1 = (const device bf4*)(x_row + 1*D);
+        const device bf4* x_row2 = (const device bf4*)(x_row + 2*D);
+        const device bf4* x_row3 = (const device bf4*)(x_row + 3*D);
+        device bf4*       out4   = (device bf4*)out_row;
 
-        for (uint d = d_base; d + 3 < (uint)D; d += stride) {
-            float4 x0 = float4(
-                (float)x_row[0*D + d],   (float)x_row[0*D + d+1],
-                (float)x_row[0*D + d+2], (float)x_row[0*D + d+3]);
-            float4 x1 = float4(
-                (float)x_row[1*D + d],   (float)x_row[1*D + d+1],
-                (float)x_row[1*D + d+2], (float)x_row[1*D + d+3]);
-            float4 x2 = float4(
-                (float)x_row[2*D + d],   (float)x_row[2*D + d+1],
-                (float)x_row[2*D + d+2], (float)x_row[2*D + d+3]);
-            float4 x3 = float4(
-                (float)x_row[3*D + d],   (float)x_row[3*D + d+1],
-                (float)x_row[3*D + d+2], (float)x_row[3*D + d+3]);
+        constexpr uint D4 = (uint)D / 4;
 
-            float4 result = p0*x0 + p1*x1 + p2*x2 + p3*x3;
+        for (uint d4 = tid; d4 < D4; d4 += 256) {
+            float4 x0 = float4(x_row0[d4]);
+            float4 x1 = float4(x_row1[d4]);
+            float4 x2 = float4(x_row2[d4]);
+            float4 x3 = float4(x_row3[d4]);
 
-            out_row[d]   = (bfloat16_t)result.x;
-            out_row[d+1] = (bfloat16_t)result.y;
-            out_row[d+2] = (bfloat16_t)result.z;
-            out_row[d+3] = (bfloat16_t)result.w;
+            float4 result = fma(float4(p0), x0,
+                            fma(float4(p1), x1,
+                            fma(float4(p2), x2, float4(p3) * x3)));
+
+            out4[d4] = bf4(result);
         }
 
         // Scalar tail for D not divisible by 4
-        for (uint d = ((uint)D / 4) * 4 + tid; d < (uint)D; d += 256) {
+        #if (D % 4) != 0
+        for (uint d = D4 * 4 + tid; d < (uint)D; d += 256) {
             float val = p0*(float)x_row[0*D+d] + p1*(float)x_row[1*D+d]
                       + p2*(float)x_row[2*D+d] + p3*(float)x_row[3*D+d];
             out_row[d] = (bfloat16_t)val;
         }
+        #endif
     """
 
     return mx.fast.metal_kernel(
