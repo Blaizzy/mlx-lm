@@ -1400,7 +1400,7 @@ class V4Attention(nn.Module):
                 self.indexer = Indexer(config, self.compress_ratio)
 
     def _ensure_cached(self, dtype):
-        if self._cached_dtype == dtype:
+        if self._cached_dtype is not None and self._cached_dtype == dtype:
             return
         self._cached_dtype = dtype
         self._attn_sink_cached = self.attn_sink.astype(dtype)
