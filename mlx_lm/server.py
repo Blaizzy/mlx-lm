@@ -350,6 +350,7 @@ class ModelProvider:
                 model_path,
                 adapter_path=adapter_path,
                 tokenizer_config=self._tokenizer_config,
+                lazy=True,
             )
 
         # Use the default chat template if needed
@@ -360,7 +361,7 @@ class ModelProvider:
         # Load the draft model for speculative decoding
         draft_model = None
         if draft_model_path is not None:
-            draft_model, draft_tokenizer = load(draft_model_path)
+            draft_model, draft_tokenizer = load(draft_model_path, lazy=True)
             if draft_tokenizer.vocab_size != tokenizer.vocab_size:
                 logging.warning(
                     "Draft model tokenizer does not match model tokenizer. "
