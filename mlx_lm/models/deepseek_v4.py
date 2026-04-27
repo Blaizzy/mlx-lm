@@ -2093,14 +2093,21 @@ class Model(nn.Module):
         weights = new_weights
 
         top_remap = {
-            "embed.weight": "model.embed_tokens.weight",
-            "norm.weight": "model.norm.weight",
-            "head.weight": "lm_head.weight",
-            "hc_head_fn": "model.hc_head.fn",
-            "hc_head_base": "model.hc_head.base",
-            "hc_head_scale": "model.hc_head.scale",
+            "embed": "model.embed_tokens",
+            "norm": "model.norm",
+            "head": "lm_head",
         }
         for old, new in top_remap.items():
+            for param in ("weight", "scales", "biases"):
+                old_key = f"{old}.{param}"
+                if old_key in weights:
+                    weights[f"{new}.{param}"] = weights.pop(old_key)
+
+        for old, new in (
+            ("hc_head_fn", "model.hc_head.fn"),
+            ("hc_head_base", "model.hc_head.base"),
+            ("hc_head_scale", "model.hc_head.scale"),
+        ):
             if old in weights:
                 weights[new] = weights.pop(old)
 
@@ -2124,14 +2131,31 @@ class Model(nn.Module):
                 ("w2", "down_proj"),
                 ("w3", "up_proj"),
             ):
+                dst_prefix = f"model.layers.{layer_idx}.ffn.switch_mlp.{dst}"
+                src_prefix = f"{prefix}.{src}"
+                for param in ("weight", "scales", "biases"):
+                    key = f"{src_prefix}.{param}"
+                    if key in weights:
+                        weights[f"{dst_prefix}.{param}"] = weights.pop(key)
+
                 key0 = f"{prefix}.0.{src}.weight"
                 if key0 in weights:
                     stacked = [
                         weights.pop(f"{prefix}.{e}.{src}.weight")
                         for e in range(self.args.n_routed_experts)
                     ]
-                    weights[f"model.layers.{layer_idx}.ffn.switch_mlp.{dst}.weight"] = (
-                        mx.stack(stacked)
+                    weights[f"{dst_prefix}.weight"] = mx.stack(stacked)
+
+            prefix = f"model.layers.{layer_idx}.attn.wo_a"
+            for param in ("weight", "scales", "biases"):
+                key0 = f"{prefix}.0.{param}"
+                if key0 in weights:
+                    weights[f"{prefix}.{param}"] = mx.concatenate(
+                        [
+                            weights.pop(f"{prefix}.{group}.{param}")
+                            for group in range(self.args.o_groups)
+                        ],
+                        axis=0,
                     )
 
         return weights

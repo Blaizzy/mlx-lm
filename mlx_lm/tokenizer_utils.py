@@ -610,17 +610,61 @@ def load(
 
     tokenizer_config_file = model_path / "tokenizer_config.json"
     chat_template = None
+    tokenizer_config_content = {}
+    if tokenizer_config_file.exists():
+        with open(tokenizer_config_file, "r", encoding="utf-8") as fid:
+            tokenizer_config_content = json.load(fid)
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path, **(tokenizer_config_extra or {})
-    )
+    if (
+        tokenizer_file.exists()
+        and tokenizer_config_content.get("tokenizer_class") == "TokenizersBackend"
+    ):
+        tokenizer_kwargs = {
+            key: tokenizer_config_content[key]
+            for key in (
+                "bos_token",
+                "eos_token",
+                "pad_token",
+                "unk_token",
+                "chat_template",
+                "clean_up_tokenization_spaces",
+                "model_max_length",
+            )
+            if key in tokenizer_config_content
+        }
+        tokenizer_kwargs.update(tokenizer_config_extra or {})
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_file=str(tokenizer_file), **tokenizer_kwargs
+        )
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path, **(tokenizer_config_extra or {})
+        )
 
-    tokenizer_config = tokenizer.init_kwargs
+    tokenizer_config = {**tokenizer_config_content, **tokenizer.init_kwargs}
 
     if chat_template_type := tokenizer_config.get("chat_template_type", False):
         chat_template = importlib.import_module(
             f"mlx_lm.chat_templates.{chat_template_type}"
         ).apply_chat_template
+    elif tokenizer.chat_template is None:
+        config_file = model_path / "config.json"
+        if config_file.exists():
+            with open(config_file, "r", encoding="utf-8") as fid:
+                model_config = json.load(fid)
+            if model_config.get("model_type") == "deepseek_v4":
+                tokenizer_config["tool_parser_type"] = "deepseek_v32"
+                deepseek_v4_template = importlib.import_module(
+                    "mlx_lm.chat_templates.deepseek_v32"
+                ).apply_chat_template
+
+                def chat_template(*args, **kwargs):
+                    enable_thinking = kwargs.pop("enable_thinking", None)
+                    if enable_thinking is not None and "thinking_mode" not in kwargs:
+                        kwargs["thinking_mode"] = (
+                            "thinking" if enable_thinking else "chat"
+                        )
+                    return deepseek_v4_template(*args, **kwargs)
 
     tool_parser_type = tokenizer_config.get(
         "tool_parser_type", _infer_tool_parser(tokenizer.chat_template)
