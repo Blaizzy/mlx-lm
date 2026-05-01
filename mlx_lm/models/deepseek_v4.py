@@ -69,8 +69,12 @@ class ModelArgs(BaseModelArgs):
                 + [4 if i % 2 else 128 for i in range(max(n - 2, 0))]
                 + ([0] if n >= 2 else [])
             )
-        self.compress_ratios = list(self.compress_ratios[: self.num_hidden_layers])
-        if len(self.compress_ratios) != self.num_hidden_layers:
+        total_layers = self.num_hidden_layers + self.num_nextn_predict_layers
+        self.compress_ratios = list(self.compress_ratios[:total_layers])
+        # MTP layers default to compress_ratio=0 (no compression)
+        while len(self.compress_ratios) < total_layers:
+            self.compress_ratios.append(0)
+        if len(self.compress_ratios) < self.num_hidden_layers:
             raise ValueError(
                 "`compress_ratios` must have one entry per hidden layer, "
                 f"got {len(self.compress_ratios)} for {self.num_hidden_layers} layers."
@@ -929,6 +933,35 @@ class DeepseekV4Block(nn.Module):
         return hc_expand(x, residual, post, comb)
 
 
+class MTPBlock(nn.Module):
+    def __init__(self, config: ModelArgs, layer_idx: int):
+        super().__init__()
+        dim = config.hidden_size
+        self.block = DeepseekV4Block(config, layer_idx)
+        self.e_proj = nn.Linear(dim, dim, bias=False)
+        self.h_proj = nn.Linear(dim, dim, bias=False)
+        self.enorm = nn.RMSNorm(dim, eps=config.rms_norm_eps)
+        self.hnorm = nn.RMSNorm(dim, eps=config.rms_norm_eps)
+        self.norm = nn.RMSNorm(dim, eps=config.rms_norm_eps)
+        self.hc_head = HyperHead(config)
+
+    def __call__(
+        self,
+        h: mx.array,
+        embed_tokens: nn.Embedding,
+        input_ids: mx.array,
+        mask: Optional[mx.array],
+        cache: Optional[Any],
+    ) -> mx.array:
+        e = embed_tokens(input_ids)
+        e = self.enorm(e)
+        h_norm = self.hnorm(h)
+        x = self.e_proj(e)[:, :, None, :] + self.h_proj(h_norm)
+        x = mx.contiguous(x)
+        x = self.block(x, mask, cache, input_ids)
+        return x
+
+
 class DeepseekV4Model(PipelineMixin, nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
@@ -941,7 +974,12 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hc_head = HyperHead(config)
 
-    def __call__(self, inputs: mx.array, cache: Optional[Any] = None) -> mx.array:
+    def __call__(
+        self,
+        inputs: mx.array,
+        cache: Optional[Any] = None,
+        return_raw_hidden: bool = False,
+    ) -> mx.array:
         h = self.embed_tokens(inputs)
         h = mx.broadcast_to(
             h[:, :, None, :],
@@ -983,7 +1021,10 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         if pipeline_size > 1:
             h = mx.distributed.all_gather(h)[: h.shape[0]]
 
-        return self.norm(self.hc_head(h))
+        out = self.norm(self.hc_head(h))
+        if return_raw_hidden:
+            return out, h
+        return out
 
 
 class Model(nn.Module):
@@ -993,9 +1034,24 @@ class Model(nn.Module):
         self.model_type = config.model_type
         self.model = DeepseekV4Model(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        if config.num_nextn_predict_layers > 0:
+            n = config.num_hidden_layers
+            self.mtp = [
+                MTPBlock(config, n + i)
+                for i in range(config.num_nextn_predict_layers)
+            ]
 
-    def __call__(self, inputs: mx.array, cache: Optional[Any] = None):
-        return self.lm_head(self.model(inputs, cache))
+    def __call__(
+        self,
+        inputs: mx.array,
+        cache: Optional[Any] = None,
+        return_hidden: bool = False,
+    ):
+        if return_hidden:
+            h, h_raw = self.model(inputs, cache, return_raw_hidden=True)
+            return self.lm_head(h), h_raw
+        h = self.model(inputs, cache)
+        return self.lm_head(h)
 
     @property
     def layers(self):
@@ -1039,12 +1095,64 @@ class Model(nn.Module):
                 )
         return caches
 
+    def make_mtp_cache(self):
+        if not hasattr(self, "mtp"):
+            return None
+        caches = []
+        for mtp_block in self.mtp:
+            attn = mtp_block.block.attn
+            if attn.compress_ratio:
+                caches.append(DeepseekV4Cache(self.args.sliding_window))
+            else:
+                caches.append(RotatingKVCache(max_size=self.args.sliding_window))
+        return caches
+
+    def mtp_forward(
+        self,
+        h: mx.array,
+        input_ids: mx.array,
+        cache: Optional[List[Any]] = None,
+    ) -> mx.array:
+        if cache is None:
+            cache = [None] * len(self.mtp)
+
+        first_cache = cache[0]
+        mask_cache = (
+            first_cache.local
+            if isinstance(first_cache, DeepseekV4Cache)
+            else first_cache
+        )
+        mask = create_attention_mask(
+            h[:, :, 0, :] if h.ndim == 4 else h,
+            mask_cache,
+            window_size=self.args.sliding_window,
+            return_array=True,
+        )
+
+        for mtp_block, layer_cache in zip(self.mtp, cache):
+            h = mtp_block(
+                h, self.model.embed_tokens, input_ids, mask, layer_cache
+            )
+
+        out = mtp_block.hc_head(h)
+        out = mtp_block.norm(out)
+        return self.lm_head(out)
+
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
         n_layers = self.args.num_hidden_layers
 
+        has_mtp = hasattr(self, "mtp")
+        has_mtp_weights = any(k.startswith("mtp.") for k in weights)
+        # Disable MTP module if weights are absent (e.g. quantized checkpoints)
+        if has_mtp and not has_mtp_weights:
+            del self.mtp
+            has_mtp = False
         new_weights = {}
         for k, v in weights.items():
             if k.startswith("mtp."):
+                if not has_mtp:
+                    continue
+                new_weights[k] = v
                 continue
             parts = k.split(".")
             if len(parts) >= 2 and parts[0] == "layers":
@@ -1100,8 +1208,23 @@ class Model(nn.Module):
 
         remapped = {}
         w_remap = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
+        mtp_block_subs = (
+            "attn.", "ffn.", "attn_norm.", "ffn_norm.",
+            "hc_attn_", "hc_ffn_",
+        )
         for k, v in weights.items():
             nk = "model." + k if k.startswith("layers.") else k
+            # MTP block: nest block-internal weights under .block.
+            if nk.startswith("mtp."):
+                parts = nk.split(".", 2)  # ["mtp", "0", "rest"]
+                if len(parts) == 3:
+                    rest = parts[2]
+                    if any(rest.startswith(s) for s in mtp_block_subs):
+                        nk = f"mtp.{parts[1]}.block.{rest}"
+                    # HC head weights for MTP block
+                    for param in ("fn", "base", "scale"):
+                        if rest == f"hc_head_{param}":
+                            nk = f"mtp.{parts[1]}.hc_head.{param}"
             nk = nk.replace(".ffn.gate.bias", ".ffn.gate.e_score_correction_bias")
             for sub in ("attn", "ffn"):
                 for param in ("fn", "base", "scale"):
@@ -1111,6 +1234,7 @@ class Model(nn.Module):
             remapped[nk] = v
         weights = remapped
 
+        # Stack routed expert weights for main model layers
         for layer_idx in range(n_layers):
             prefix = f"model.layers.{layer_idx}.ffn.experts"
             for src, dst in (
@@ -1137,6 +1261,25 @@ class Model(nn.Module):
                     weights[key] = weights[key].reshape(
                         self.args.o_groups, self.args.o_lora_rank, -1
                     )
+
+        # Stack routed expert weights for MTP layers
+        if has_mtp:
+            for mtp_idx in range(self.args.num_nextn_predict_layers):
+                prefix = f"mtp.{mtp_idx}.block.ffn.experts"
+                for src, dst in (
+                    ("w1", "gate_proj"),
+                    ("w2", "down_proj"),
+                    ("w3", "up_proj"),
+                ):
+                    key0 = f"{prefix}.0.{src}.weight"
+                    if key0 in weights:
+                        stacked = [
+                            weights.pop(f"{prefix}.{e}.{src}.weight")
+                            for e in range(self.args.n_routed_experts)
+                        ]
+                        weights[
+                            f"mtp.{mtp_idx}.block.ffn.switch_mlp.{dst}.weight"
+                        ] = mx.stack(stacked)
 
         return weights
 
