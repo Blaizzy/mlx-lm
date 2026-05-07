@@ -330,7 +330,7 @@ class TestToolParsing(unittest.TestCase):
         self.assertEqual(expected, tool_calls)
 
     def test_deepseek_v4(self):
-        self.assertEqual(deepseek_v4.tool_call_start, "\n\n<｜DSML｜tool_calls")
+        self.assertEqual(deepseek_v4.tool_call_start, "<｜DSML｜tool_calls")
 
         # Single call with the closing tag bracket captured as tool text.
         test_case = (

@@ -5,8 +5,11 @@ import regex as re
 
 _dsml = "｜DSML｜"
 
-# Match the official parser sentinel and stop before ">", which can merge with "\n".
-tool_call_start: str = f"\n\n<{_dsml}tool_calls"
+# Match from the DSML tag, not the official text sentinel's leading newlines.
+# The server detects tool calls with token sequences, and DS4 can tokenize the
+# same text as either "\n\n" or as part of the previous token, e.g. ".\n\n".
+# Stop before ">" as well because the closing bracket can merge with "\n".
+tool_call_start: str = f"<{_dsml}tool_calls"
 tool_call_end: str = f"</{_dsml}tool_calls>"
 
 _invoke_re = re.compile(
