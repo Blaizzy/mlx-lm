@@ -1,7 +1,7 @@
 import unittest
-from pathlib import Path
 
 from mlx_lm.tool_parsers import (
+    deepseek_v4,
     function_gemma,
     gemma4,
     glm47,
@@ -328,6 +328,40 @@ class TestToolParsing(unittest.TestCase):
         ]
         tool_calls = minimax_m2.parse_tool_call(test_case, None)
         self.assertEqual(expected, tool_calls)
+
+    def test_deepseek_v4(self):
+        self.assertEqual(deepseek_v4.tool_call_start, "\n\n<｜DSML｜tool_calls")
+
+        # Single call with the closing tag bracket captured as tool text.
+        test_case = (
+            '>\n<｜DSML｜invoke name="get_weather">\n'
+            '<｜DSML｜parameter name="location" string="true">Beijing</｜DSML｜parameter>\n'
+            '<｜DSML｜parameter name="num_results" string="false">5</｜DSML｜parameter>\n'
+            '</｜DSML｜invoke>\n'
+        )
+        result = deepseek_v4.parse_tool_call(test_case, None)
+        self.assertEqual(result["name"], "get_weather")
+        self.assertEqual(result["arguments"]["location"], "Beijing")
+        self.assertEqual(result["arguments"]["num_results"], 5)
+
+        # Multiple calls
+        test_case = (
+            '\n<｜DSML｜invoke name="search">\n'
+            '<｜DSML｜parameter name="query" string="true">weather</｜DSML｜parameter>\n'
+            '</｜DSML｜invoke>\n'
+            '<｜DSML｜invoke name="read_file">\n'
+            '<｜DSML｜parameter name="path" string="true">/tmp/test.txt</｜DSML｜parameter>\n'
+            '</｜DSML｜invoke>\n'
+        )
+        result = deepseek_v4.parse_tool_call(test_case, None)
+        self.assertIsInstance(result, list)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(
+            result[0], {"name": "search", "arguments": {"query": "weather"}}
+        )
+        self.assertEqual(
+            result[1], {"name": "read_file", "arguments": {"path": "/tmp/test.txt"}}
+        )
 
 
 if __name__ == "__main__":
