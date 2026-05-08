@@ -908,6 +908,8 @@ class PoolingCache(_BaseCache):
       2. A small remainder buffer of tokens not yet forming a full window.
     """
 
+    step = 256
+
     def __init__(self, ratio: int):
         self.ratio = ratio
 
@@ -915,6 +917,12 @@ class PoolingCache(_BaseCache):
         self.buf_gate = None
         self.remainder = 0
 
+        # The pool is appended to on every call. Resizing to fit each chunk
+        # would issue an mx.concatenate per call, piling up lazy-graph nodes
+        # until Metal's per-command-buffer resource limit crashes long runs.
+        # Instead, self._buf is the storage (grown in self.step chunks) and
+        # self.pooled is a logical-size view; mutation sites keep them in sync.
+        self._buf = None
         self.pooled = None
 
     @property
@@ -984,15 +992,25 @@ class PoolingCache(_BaseCache):
             return r_kv, r_gate, r_base
 
     def update_and_fetch(self, px: mx.array):
-        if px.shape[1] == 0:
+        B, N, D = px.shape
+        if N == 0:
             if self.pooled is None:
-                return mx.zeros((px.shape[0], 0, px.shape[-1]), dtype=px.dtype)
+                return mx.zeros((B, 0, D), dtype=px.dtype)
             return self.pooled
 
-        if self.pooled is None:
-            self.pooled = px
-        else:
-            self.pooled = mx.concatenate([self.pooled, px], axis=1)
+        cur = 0 if self.pooled is None else self.pooled.shape[1]
+        new_len = cur + N
+
+        if self._buf is None:
+            cap = ((new_len + self.step - 1) // self.step) * self.step
+            self._buf = mx.zeros((B, cap, D), dtype=px.dtype)
+        elif self._buf.shape[1] < new_len:
+            cap = ((new_len + self.step - 1) // self.step) * self.step
+            pad = mx.zeros((B, cap - self._buf.shape[1], D), dtype=px.dtype)
+            self._buf = mx.concatenate([self._buf, pad], axis=1)
+
+        self._buf[:, cur:new_len] = px
+        self.pooled = self._buf[:, :new_len]
         return self.pooled
 
     def make_mask(self, L: int = 1, offset: int = 0):
@@ -1025,6 +1043,7 @@ class PoolingCache(_BaseCache):
         if buf_kv is not None:
             self.accumulate_windows(buf_kv, buf_gate, 0)
         self.pooled = pooled
+        self._buf = pooled
 
     @property
     def meta_state(self):
@@ -1065,6 +1084,8 @@ class PoolingCache(_BaseCache):
 class BatchPoolingCache(_BaseCache):
     """Batched pooling cache with per-element variable-length tracking."""
 
+    step = 256
+
     def __init__(self, ratio: int, left_padding: List[int]):
         self.ratio = ratio
 
@@ -1077,6 +1098,8 @@ class BatchPoolingCache(_BaseCache):
         self.buf_gate = None
         self.remainder = [0] * batch_size
 
+        # See PoolingCache.__init__.
+        self._buf = None
         self.pooled = None
         self._pool_lengths = [0] * batch_size
 
@@ -1205,19 +1228,22 @@ class BatchPoolingCache(_BaseCache):
 
         max_pool = max(self._pool_lengths) + max_new
 
-        if self.pooled is None:
-            self.pooled = mx.zeros((B, max_pool, D), dtype=px.dtype)
-        elif self.pooled.shape[1] < max_pool:
-            pad = mx.zeros((B, max_pool - self.pooled.shape[1], D), dtype=px.dtype)
-            self.pooled = mx.concatenate([self.pooled, pad], axis=1)
+        if self._buf is None:
+            cap = ((max_pool + self.step - 1) // self.step) * self.step
+            self._buf = mx.zeros((B, cap, D), dtype=px.dtype)
+        elif self._buf.shape[1] < max_pool:
+            cap = ((max_pool + self.step - 1) // self.step) * self.step
+            pad = mx.zeros((B, cap - self._buf.shape[1], D), dtype=px.dtype)
+            self._buf = mx.concatenate([self._buf, pad], axis=1)
 
         for i in range(B):
             nc = new_counts[i]
             if nc > 0:
                 pl = self._pool_lengths[i]
-                self.pooled[i, pl : pl + nc] = px[i, :nc]
+                self._buf[i, pl : pl + nc] = px[i, :nc]
                 self._pool_lengths[i] = pl + nc
 
+        self.pooled = self._buf[:, :max(self._pool_lengths)]
         return self.pooled
 
     def make_mask(self, L: int = 1, offset=0):
@@ -1254,6 +1280,7 @@ class BatchPoolingCache(_BaseCache):
     @state.setter
     def state(self, v):
         self.buf_kv, self.buf_gate, self.pooled = v
+        self._buf = self.pooled
 
     @property
     def meta_state(self):
@@ -1299,6 +1326,7 @@ class BatchPoolingCache(_BaseCache):
             self.buf_gate = self.buf_gate[batch_indices]
         if self.pooled is not None:
             self.pooled = self.pooled[batch_indices]
+            self._buf = self.pooled
 
         self.remainder = [self.remainder[i] for i in idx_list]
         self._pool_lengths = [self._pool_lengths[i] for i in idx_list]
@@ -1372,6 +1400,7 @@ class BatchPoolingCache(_BaseCache):
                     [pad_pool(self.pooled, B1, P1), pad_pool(other.pooled, B2, P2)],
                     axis=0,
                 )
+                self._buf = self.pooled
 
         self.remainder = self.remainder + other.remainder
         self._pool_lengths = self._pool_lengths + other._pool_lengths
@@ -1385,6 +1414,7 @@ class BatchPoolingCache(_BaseCache):
 
         if self.pooled is not None and pl > 0:
             cache.pooled = mx.contiguous(self.pooled[idx : idx + 1, :pl])
+            cache._buf = cache.pooled
 
         if self.buf_kv is not None and r > 0:
             cache.buf_kv = mx.contiguous(self.buf_kv[idx : idx + 1])
@@ -1420,6 +1450,7 @@ class BatchPoolingCache(_BaseCache):
                     ps = c.pooled.shape[1]
                     pooled[i, :ps] = c.pooled[0]
             batch_cache.pooled = pooled
+            batch_cache._buf = pooled
 
         batch_cache._pool_lengths = pool_sizes
         batch_cache.remainder = [c.remainder for c in caches]
