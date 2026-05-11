@@ -1786,6 +1786,7 @@ class BatchGenerator:
             self._gen_tokens_counter += len(generation_responses)
             self._steps_counter += 1
             if self._steps_counter % 512 == 0:
+                mx.eval([c.state for c in self._generation_batch.prompt_cache])
                 mx.clear_cache()
 
         # Exit early because we already have our hands full with decoding
