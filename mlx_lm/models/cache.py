@@ -1072,8 +1072,9 @@ class PoolingCache(_BaseCache):
         total = 0
         if self.buf_kv is not None:
             total += self.buf_kv.nbytes + self.buf_gate.nbytes
-        if self.pooled is not None:
-            total += self.pooled.nbytes
+        pool = self._buf if self._buf is not None else self.pooled
+        if pool is not None:
+            total += pool.nbytes
         return total
 
     @classmethod
@@ -1311,8 +1312,9 @@ class BatchPoolingCache(_BaseCache):
         total = 0
         if self.buf_kv is not None:
             total += self.buf_kv.nbytes + self.buf_gate.nbytes
-        if self.pooled is not None:
-            total += self.pooled.nbytes
+        pool = self._buf if self._buf is not None else self.pooled
+        if pool is not None:
+            total += pool.nbytes
         return total
 
     def filter(self, batch_indices):
