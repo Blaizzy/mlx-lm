@@ -1268,7 +1268,7 @@ class BatchPoolingCache(_BaseCache):
         if isinstance(offset, mx.array):
             query_pos = offset[:, None] + mx.arange(1, L + 1)
         else:
-            query_pos = offset + mx.arange(offset + 1, offset + L + 1)[None]
+            query_pos = offset + mx.arange(1, L + 1)[None]
 
         causal = pool_idx < (query_pos[..., None] // self.ratio)
         mask = causal & valid

@@ -12,10 +12,12 @@ from mlx_lm.models.base import create_attention_mask, create_causal_mask
 from mlx_lm.models.cache import (
     ArraysCache,
     BatchKVCache,
+    BatchPoolingCache,
     BatchRotatingKVCache,
     CacheList,
     ChunkedKVCache,
     KVCache,
+    PoolingCache,
     QuantizedKVCache,
     RotatingKVCache,
     load_prompt_cache,
@@ -529,6 +531,22 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(cache_a.values.shape[0], 5)
         self.assertEqual(cache_a.offset.tolist(), [6, 7, 6, 1, 4])
         self.assertEqual(cache_a.left_padding.tolist(), [2, 1, 2, 7, 4])
+
+    def test_batch_pooling_cache_scalar_offset_mask(self):
+        ratio = 4
+        caches = [PoolingCache(ratio), PoolingCache(ratio)]
+        for cache in caches:
+            pooled = mx.zeros((1, 6, 8), dtype=mx.float32)
+            cache.update_and_fetch(pooled)
+
+        batch_cache = BatchPoolingCache.merge(caches)
+        mask = batch_cache.make_mask(L=3, offset=8)
+
+        expected = mx.arange(6)[None] < (
+            8 + mx.arange(1, 4)
+        )[:, None] // ratio
+        self.assertTrue(mx.array_equal(mask[0], expected))
+        self.assertTrue(mx.array_equal(mask[1], expected))
 
     def test_batch_rotating_kv_cache(self):
         cache = BatchRotatingKVCache(max_size=4, left_padding=[2, 0])
