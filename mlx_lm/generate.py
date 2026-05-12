@@ -467,6 +467,12 @@ def generate_step(
             break
         yield y.item(), logprobs
         if n % 256 == 0:
+            # Materialize cache state to break the lazy graph chain.
+            # Without this, per-step view rebinds (e.g. PoolingCache's
+            # `self.pooled = self._buf[:, :new_len]`) accumulate as
+            # graph nodes for the entire decode, eventually exhausting
+            # Metal's per-command-buffer resource limit on long runs.
+            mx.eval([c.state for c in prompt_cache])
             mx.clear_cache()
         y, logprobs = next_y, next_logprobs
         n += 1
@@ -1780,6 +1786,7 @@ class BatchGenerator:
             self._gen_tokens_counter += len(generation_responses)
             self._steps_counter += 1
             if self._steps_counter % 512 == 0:
+                mx.eval([c.state for c in self._generation_batch.prompt_cache])
                 mx.clear_cache()
 
         # Exit early because we already have our hands full with decoding
